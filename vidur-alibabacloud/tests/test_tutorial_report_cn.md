@@ -407,14 +407,57 @@ TP rank 的 head 数量。对于 DeepSeek-V3 (`num_attention_heads=128`):
 
 - FlashMLA main 分支 (截至 2026-04-21): `B_H=64` 未变 (`config.h`)
 - 代码结构重构: 断言从 `fwd.cu:647` 移至 `phase1.cuh`，但约束逻辑不变
-- 上游 PR #150 (2026-01-16) 做了多处重构，但 B_H 值未修改
+- 上游 [FlashMLA PR #150](https://github.com/deepseek-ai/FlashMLA/pull/150) (2026-01-16) 做了多处重构，但 B_H 值未修改
 
 **结论**: 上游最新版本仍有此约束，非 pinned 版本特有问题。
+
+#### vLLM 源码对照 (回答 reviewer: "vllm源码怎么写的")
+
+**(a) vLLM v0.11.0 (AICB pinned) 中的调用路径:**
+
+| 层级 | 文件 | 关键内容 |
+|------|------|----------|
+| ops 层 | [`vllm/attention/ops/flashmla.py`](https://github.com/vllm-project/vllm/blob/v0.11.0/vllm/attention/ops/flashmla.py) | `flash_mla_sparse_prefill()` → 调用 `torch.ops._flashmla_C.sparse_prefill_fwd` |
+| backend 层 | [`vllm/v1/attention/backends/mla/flashmla_sparse.py`](https://github.com/vllm-project/vllm/blob/v0.11.0/vllm/v1/attention/backends/mla/flashmla_sparse.py) (544行) | 导入 `flash_mla_sparse_prefill`，prefill 阶段直接调用 |
+
+- **无 head padding 机制**: h_q 直接传入 CUDA kernel，h_q < 64 → 触发 `B_H=64` 断言失败
+
+**(b) AICB 的调用路径:**
+
+| 层级 | 文件 | 关键内容 |
+|------|------|----------|
+| 入口 | `AiobDeepSeek.py:235` | 调用 `flash_mla_sparse_fwd()` (直接导入 flash_mla Python 包) |
+
+- Python 入口函数名不同: vLLM 用 `flash_mla_sparse_prefill`，AICB 用 `flash_mla_sparse_fwd`
+- **底层执行相同的 FlashMLA SM90 CUDA sparse prefill kernel**
+- h_q 计算方式一致: `h_q = num_attention_heads // tp`
+- **结论: AICB 仿真调用路径与 vLLM v0.11.0 的真实推理路径在底层 CUDA kernel 层面一致**
+
+**(c) latest vLLM 补充备注:**
+
+> 版本标注: vLLM main HEAD [`582340f27`](https://github.com/vllm-project/vllm/blob/582340f27/vllm/v1/attention/backends/mla/flashmla_sparse.py) (约 v0.18.2, 截至 2026-04-21)
+
+| DeepSeek-V3 tp | h_q | v0.11.0 行为 | main 行为 | main workaround 路径 |
+|----------------|-----|------------|----------|-----------------------|
+| tp=1 | 128 | PASS | PASS | 不需要 |
+| tp=2 | 64 | PASS | PASS | 不需要 |
+| tp=4 | 32 | **FAIL** | **PASS** | BF16 prefill + head padding (32→64) |
+| tp=8 | 16 | **FAIL** | **PASS** | mixed batch FP8 decode kernel (绕过 BF16 prefill) |
+
+- 新增 `MIN_HEADS_FOR_BF16_PREFILL = 32` (L63)
+- tp=4 (h_q=32): `32 < 32` = False → BF16 prefill + head padding 到 64
+- tp=8 (h_q=16): `16 < 32` = True → mixed batch FP8 → 绕过 BF16 prefill 约束
+- **备注: 此 workaround 不影响当前 AICB 结论**，因为 AICB pinned 的是 v0.11.0
 
 #### 第三层: 仿真与真实一致性
 
 - AICB 的 `h_q = num_heads // tp` 与真实 vLLM 推理时的 head 分配逻辑一致
 - 真实 vLLM 在 tp>=4 时也会触发同样的 FlashMLA 断言
+- **vLLM v0.11.0**: AICB 仿真行为 = vLLM 真实推理行为（都会在 tp>=4 触发断言）
+- **vLLM main (582340f27)**: 已通过两种方式规避了此问题：
+  - tp=4 (h_q=32): 在调用 kernel 前将 h_q 从 32 填充到 64 (head padding)，使其满足 `h_q % 64 == 0`，不再触发断言
+  - tp=8 (h_q=16): 切换到 FP8 mixed batch decode kernel，完全绕过了 BF16 sparse prefill 路径，不会触发 B_H=64 约束
+  - **但这不影响当前 AICB 结论**，因为 AICB pinned 的是 v0.11.0，该版本没有以上 workaround
 - **结论**: 仿真行为 = 真实行为（都会触发），仿真是准确的
 
 ### A.9 bs=8 补测实验日志 (2026-04-21)
