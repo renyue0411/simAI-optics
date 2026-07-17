@@ -21,6 +21,7 @@
 
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <time.h>
 #include <unordered_map>
 
@@ -41,6 +42,8 @@
 #include <ns3/sim-setting.h>
 #include <ns3/switch-node.h>
 #include <ns3/nvswitch-node.h>
+#include <ns3/ocs-node.h>
+#include <ns3/ocs-data-plane-controller.h>
 #include <atomic>
 
 using namespace ns3;
@@ -89,6 +92,9 @@ uint32_t enable_trace = 1;
 uint32_t buffer_size = 16;
 
 uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server;
+uint32_t ocs_num = 0;
+uint32_t ocs_schedule_enable = 0;
+std::string ocs_map_file, ocs_schedule_file;
 GPUType gpu_type;
 std::vector<int>NVswitchs;
 
@@ -263,7 +269,7 @@ void CalculateRoute(Ptr<Node> host) {
         txDelay[next] = txDelay[now] +
                         packet_payload_size * 1000000000lu * 8 / it->second.bw;
         bw[next] = std::min(bw[now], it->second.bw);
-        if (next->GetNodeType() == 1 || next->GetNodeType() == 2) {
+        if (next->GetNodeType() == 1 || next->GetNodeType() == 2 || next->GetNodeType() == 3) {
           q.push_back(next);
         }
           
@@ -310,6 +316,9 @@ void CalculateRoutes(NodeContainer &n) {
 void SetRoutingEntries() {
   for (auto i = nextHop.begin(); i != nextHop.end(); i++) {
     Ptr<Node> node = i->first;
+    if (node->GetNodeType() == 3) {
+      continue;
+    }
     auto &table = i->second;
     for (auto j = table.begin(); j != table.end(); j++) {
       Ptr<Node> dst = j->first;
@@ -343,6 +352,7 @@ void printRoutingEntries() {
   types[0] = "HOST";
   types[1] = "SWITCH";
   types[2] = "NVSWITCH";
+  types[3] = "OCS";
   map<Ptr<Node>, map<Ptr<Node>, vector<pair<Ptr<Node>, uint32_t> >>> NVSwitch, NetSwitch, Host; 
   for (auto i = nextHop.begin(); i != nextHop.end(); i++) {
     Ptr<Node> src = i -> first;
@@ -430,6 +440,8 @@ void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
 			DynamicCast<SwitchNode>(n.Get(i))->ClearTable();
 		else if(n.Get(i)->GetNodeType() == 2)
 			DynamicCast<NVSwitchNode>(n.Get(i))->ClearTable();
+		else if(n.Get(i)->GetNodeType() == 3)
+			continue;
 		else
 			n.Get(i)->GetObject<RdmaDriver>()->m_rdma->ClearTable();
 	}
@@ -591,6 +603,12 @@ bool ReadConf(string network_topo,string network_conf) {
         conf >> nic_total_pause_time;
       } else if (key.compare("PFC_OUTPUT_FILE") == 0) {
         conf >> pfc_output_file;
+      } else if (key.compare("OCS_SCHEDULE_ENABLE") == 0) {
+        conf >> ocs_schedule_enable;
+      } else if (key.compare("OCS_MAP_FILE") == 0) {
+        conf >> ocs_map_file;
+      } else if (key.compare("OCS_SCHEDULE_FILE") == 0) {
+        conf >> ocs_schedule_file;
       } else if (key.compare("LINK_DOWN") == 0) {
         conf >> link_down_time >> link_down_A >> link_down_B;
       } else if (key.compare("ENABLE_TRACE") == 0) {
@@ -698,8 +716,38 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
   tracef.open(trace_file.c_str());
   string gpu_type_str;
 
-  topof >> node_num >> gpus_per_server >> nvswitch_num >> switch_num >>
-      link_num >> gpu_type_str;
+  std::string topo_header_line;
+  std::getline(topof, topo_header_line);
+  while (topo_header_line.size() == 0 && std::getline(topof, topo_header_line)) {
+  }
+
+  std::stringstream topo_header(topo_header_line);
+  std::vector<std::string> topo_header_fields;
+  std::string topo_header_token;
+  while (topo_header >> topo_header_token) {
+    topo_header_fields.push_back(topo_header_token);
+  }
+
+  if (topo_header_fields.size() == 6) {
+    node_num = std::stoul(topo_header_fields[0]);
+    gpus_per_server = std::stoul(topo_header_fields[1]);
+    nvswitch_num = std::stoul(topo_header_fields[2]);
+    switch_num = std::stoul(topo_header_fields[3]);
+    ocs_num = 0;
+    link_num = std::stoul(topo_header_fields[4]);
+    gpu_type_str = topo_header_fields[5];
+  } else if (topo_header_fields.size() == 7) {
+    node_num = std::stoul(topo_header_fields[0]);
+    gpus_per_server = std::stoul(topo_header_fields[1]);
+    nvswitch_num = std::stoul(topo_header_fields[2]);
+    switch_num = std::stoul(topo_header_fields[3]);
+    ocs_num = std::stoul(topo_header_fields[4]);
+    link_num = std::stoul(topo_header_fields[5]);
+    gpu_type_str = topo_header_fields[6];
+  } else {
+    NS_ABORT_MSG("Invalid topology header. Expected 6 legacy fields or 7 SimAI+OCS fields, got "
+                 << topo_header_fields.size() << ": " << topo_header_line);
+  }
   flowf >> flow_num;
   tracef >> trace_num;
   if(gpu_type_str == "A100"){
@@ -726,7 +774,24 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 		topof >> sid;
 		node_type[sid] = 1;
 	}
+	std::vector<uint32_t> ocs_node_ids;
+
+	for (uint32_t i = 0; i < ocs_num; i++)
+
+	{
+
+		uint32_t sid;
+
+		topof >> sid;
+
+		node_type[sid] = 3;
+
+		ocs_node_ids.push_back(sid);
+
+	}
+
 	for (uint32_t i = 0; i < node_num; i++){
+
 		if (node_type[i] == 0)
 			n.Add(CreateObject<Node>());
 		else if(node_type[i] == 1){
@@ -736,8 +801,20 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 		}else if(node_type[i] == 2){
 			Ptr<NVSwitchNode> sw = CreateObject<NVSwitchNode>();
 			n.Add(sw);
+		}else if(node_type[i] == 3){
+			Ptr<OcsNode> ocs = CreateObject<OcsNode>();
+			n.Add(ocs);
 		}
 	}
+
+  Ptr<OcsDataPlaneController> ocs_dp_controller = CreateObject<OcsDataPlaneController>();
+  ocs_dp_controller->SetNodeContainer(n);
+  for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
+    ocs_dp_controller->AddOcsNode(ocs_node_ids[i]);
+  }
+  if (ocs_num > 0) {
+    NS_LOG_UNCOND("[OCS TOPOLOGY] ocs_count=" << ocs_num);
+  }
 
   NS_LOG_INFO("Create nodes.");
   InternetStackHelper internet;
@@ -768,9 +845,19 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
   Ipv4AddressHelper ipv4;
   for (uint32_t i = 0; i < link_num; i++) {
     uint32_t src, dst;
+    uint32_t src_logical_port = 0, dst_logical_port = 0;
     std::string data_rate, link_delay;
     double error_rate;
-    topof >> src >> dst >> data_rate >> link_delay >> error_rate;
+    topof >> src >> dst;
+    if (src >= node_num || dst >= node_num) {
+      NS_ABORT_MSG("Topology link references invalid node id: " << src << " " << dst);
+    }
+    bool is_ocs_link = (node_type[src] == 3 || node_type[dst] == 3);
+    if (is_ocs_link) {
+      topof >> src_logical_port >> dst_logical_port >> data_rate >> link_delay >> error_rate;
+    } else {
+      topof >> data_rate >> link_delay >> error_rate;
+    }
     Ptr<Node> snode = n.Get(src), dnode = n.Get(dst);
     
     qbb.SetDeviceAttribute("DataRate", StringValue(data_rate));
@@ -825,6 +912,21 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     nbr2if[dnode][snode].bw =
         DynamicCast<QbbNetDevice>(d.Get(1))->GetDataRate().GetBitRate();
 
+    
+    if (is_ocs_link) {
+      Ptr<QbbNetDevice> sdev = DynamicCast<QbbNetDevice>(d.Get(0));
+      Ptr<QbbNetDevice> ddev = DynamicCast<QbbNetDevice>(d.Get(1));
+      uint64_t sdelay = DynamicCast<QbbChannel>(sdev->GetChannel())->GetDelay().GetTimeStep();
+      uint64_t ddelay = DynamicCast<QbbChannel>(ddev->GetChannel())->GetDelay().GetTimeStep();
+      uint64_t sbw = sdev->GetDataRate().GetBitRate();
+      uint64_t dbw = ddev->GetDataRate().GetBitRate();
+
+      ocs_dp_controller->AddPortBinding(src, src_logical_port, sdev->GetIfIndex(),
+                                        dst, dst_logical_port, sdelay, sbw);
+      ocs_dp_controller->AddPortBinding(dst, dst_logical_port, ddev->GetIfIndex(),
+                                        src, src_logical_port, ddelay, dbw);
+    }
+
     char ipstring[16];
     sprintf(ipstring, "10.%d.%d.0", i / 254 + 1, i % 254 + 1);
     ipv4.SetBase(ipstring, "255.255.255.0");
@@ -836,6 +938,32 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     DynamicCast<QbbNetDevice>(d.Get(1))->TraceConnectWithoutContext(
         "QbbPfc", MakeBoundCallback(&get_pfc, pfc_file,
                                     DynamicCast<QbbNetDevice>(d.Get(1))));
+  }
+
+
+  if (ocs_num > 0) {
+    std::ofstream port_binding_out("ocs_port_bindings.txt");
+    if (port_binding_out.is_open()) {
+      ocs_dp_controller->DumpPortBindings(port_binding_out);
+      port_binding_out.close();
+    }
+
+    if (ocs_schedule_enable) {
+      if (ocs_schedule_file.empty()) {
+        NS_ABORT_MSG("OCS_SCHEDULE_ENABLE=1 but OCS_SCHEDULE_FILE is empty");
+      }
+      ocs_dp_controller->LoadCompactSchedule(ocs_schedule_file);
+
+      std::ofstream expanded_out("ocs_schedule_expanded.txt");
+      if (expanded_out.is_open()) {
+        ocs_dp_controller->DumpExpandedSchedule(expanded_out);
+        expanded_out.close();
+      }
+    } else if (!ocs_map_file.empty()) {
+      ocs_dp_controller->LoadStaticMap(ocs_map_file);
+    } else {
+      NS_LOG_UNCOND("[OCS WARNING] OCS nodes exist but neither schedule nor map is enabled");
+    }
   }
 
   nic_rate = get_nic_rate(n);

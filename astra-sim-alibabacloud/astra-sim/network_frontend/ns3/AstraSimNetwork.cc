@@ -47,7 +47,7 @@ using namespace std;
 using namespace ns3;
 
 extern std::map<std::pair<std::pair<int, int>,int>, AstraSim::ncclFlowTag> receiver_pending_queue;
-extern uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server;
+extern uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server, ocs_num;
 extern GPUType gpu_type;
 extern std::vector<int>NVswitchs;
 
@@ -270,8 +270,8 @@ int main(int argc, char *argv[]) {
   #endif
   
   main1(user_param.network_topo,user_param.network_conf);
-  int nodes_num = node_num - switch_num;
-  int gpu_num = node_num - nvswitch_num - switch_num;
+  int nodes_num = node_num - switch_num - ocs_num;
+  int gpu_num = node_num - nvswitch_num - switch_num - ocs_num;
 
   std::map<int, int> node2nvswitch; 
   for(int i = 0; i < gpu_num; ++ i) {
