@@ -44,6 +44,7 @@
 #include <ns3/nvswitch-node.h>
 #include <ns3/ocs-node.h>
 #include <ns3/ocs-data-plane-controller.h>
+#include <ns3/rdma-ocs-controller.h>
 #include <atomic>
 
 using namespace ns3;
@@ -94,6 +95,12 @@ uint32_t buffer_size = 16;
 uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server;
 uint32_t ocs_num = 0;
 uint32_t ocs_schedule_enable = 0;
+uint32_t rnic_gate_enable = 0;
+uint64_t rnic_gate_margin_ns = 200000;
+uint64_t rnic_gate_burst_bytes = 65536;
+uint32_t ocs_stats_enable = 0;
+uint64_t ocs_stats_interval_us = 10000;
+uint64_t ocs_stats_start_us = 0;
 std::string ocs_map_file, ocs_schedule_file;
 GPUType gpu_type;
 std::vector<int>NVswitchs;
@@ -609,7 +616,23 @@ bool ReadConf(string network_topo,string network_conf) {
         conf >> ocs_map_file;
       } else if (key.compare("OCS_SCHEDULE_FILE") == 0) {
         conf >> ocs_schedule_file;
-      } else if (key.compare("LINK_DOWN") == 0) {
+      } else if (key.compare("OCS_STATS_ENABLE") == 0) {
+  conf >> ocs_stats_enable;
+  } else if (key.compare("OCS_STATS_INTERVAL_US") == 0) {
+  conf >> ocs_stats_interval_us;
+  } else if (key.compare("OCS_STATS_START_US") == 0) {
+  conf >> ocs_stats_start_us;
+
+  } else if (key.compare("RNIC_GATE_ENABLE") == 0) {
+  conf >> rnic_gate_enable;
+
+  } else if (key.compare("RNIC_GATE_MARGIN_NS") == 0) {
+  conf >> rnic_gate_margin_ns;
+
+  } else if (key.compare("RNIC_GATE_BURST_BYTES") == 0) {
+  conf >> rnic_gate_burst_bytes;
+
+  } else if (key.compare("LINK_DOWN") == 0) {
         conf >> link_down_time >> link_down_A >> link_down_B;
       } else if (key.compare("ENABLE_TRACE") == 0) {
         conf >> enable_trace;
@@ -709,6 +732,62 @@ void SetConfig() {
   }
 }
 
+
+static bool
+ReadNextTopologyDataLine(std::ifstream& input, std::string& line)
+{
+  while (std::getline(input, line))
+    {
+      std::string::size_type comment = line.find('#');
+      if (comment != std::string::npos)
+        {
+          line = line.substr(0, comment);
+        }
+
+      const char* ws = " \t\r\n";
+      std::string::size_type begin = line.find_first_not_of(ws);
+      if (begin == std::string::npos)
+        {
+          continue;
+        }
+
+      std::string::size_type end = line.find_last_not_of(ws);
+      line = line.substr(begin, end - begin + 1);
+      return true;
+    }
+
+  return false;
+}
+
+
+static void
+DumpOcsStatsOnce()
+{
+  for (uint32_t i = 0; i < node_num; i++)
+    {
+      if (n.Get(i)->GetNodeType() == 3)
+        {
+          Ptr<OcsNode> ocs = DynamicCast<OcsNode>(n.Get(i));
+          if (ocs != 0)
+            {
+              ocs->DumpStats();
+            }
+        }
+    }
+}
+
+static void
+DumpOcsStatsPeriodic()
+{
+  DumpOcsStatsOnce();
+
+  if (ocs_stats_enable && ocs_stats_interval_us > 0)
+    {
+      Simulator::Schedule(MicroSeconds(ocs_stats_interval_us),
+                          &DumpOcsStatsPeriodic);
+    }
+}
+
 void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_finish)(FILE *, Ptr<RdmaQueuePair>)) {
 
   topof.open(topology_file.c_str());
@@ -717,9 +796,10 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
   string gpu_type_str;
 
   std::string topo_header_line;
-  std::getline(topof, topo_header_line);
-  while (topo_header_line.size() == 0 && std::getline(topof, topo_header_line)) {
-  }
+  if (!ReadNextTopologyDataLine(topof, topo_header_line))
+    {
+      NS_ABORT_MSG("Topology file is empty or only contains comments: " << topology_file);
+    }
 
   std::stringstream topo_header(topo_header_line);
   std::vector<std::string> topo_header_fields;
@@ -748,6 +828,14 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     NS_ABORT_MSG("Invalid topology header. Expected 6 legacy fields or 7 SimAI+OCS fields, got "
                  << topo_header_fields.size() << ": " << topo_header_line);
   }
+  std::ostringstream topo_remaining_buf;
+  std::string topo_data_line;
+  while (ReadNextTopologyDataLine(topof, topo_data_line))
+    {
+      topo_remaining_buf << topo_data_line << "\n";
+    }
+  std::istringstream topo_data(topo_remaining_buf.str());
+
   flowf >> flow_num;
   tracef >> trace_num;
   if(gpu_type_str == "A100"){
@@ -765,13 +853,13 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
   std::vector<uint32_t> node_type(node_num, 0);
   for (uint32_t i = 0; i < nvswitch_num; i++) {
     uint32_t sid;
-    topof >> sid;
+    topo_data >> sid;
     node_type[sid] = 2;
 	}
 	for (uint32_t i = 0; i < switch_num; i++)
 	{
 		uint32_t sid;
-		topof >> sid;
+		topo_data >> sid;
 		node_type[sid] = 1;
 	}
 	std::vector<uint32_t> ocs_node_ids;
@@ -782,7 +870,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 
 		uint32_t sid;
 
-		topof >> sid;
+		topo_data >> sid;
 
 		node_type[sid] = 3;
 
@@ -808,8 +896,13 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 	}
 
   Ptr<OcsDataPlaneController> ocs_dp_controller = CreateObject<OcsDataPlaneController>();
-  ocs_dp_controller->SetNodeContainer(n);
-  for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
+  
+  Ptr<RdmaOcsController> rdmaOcsController = CreateObject<RdmaOcsController>();
+ocs_dp_controller->SetNodeContainer(n);
+    rdmaOcsController->SetNodeContainer(n);
+    rdmaOcsController->SetRnicGateExtraMarginNs(rnic_gate_margin_ns);
+    rdmaOcsController->SetRnicGateBurstBytes(rnic_gate_burst_bytes);
+for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
     ocs_dp_controller->AddOcsNode(ocs_node_ids[i]);
   }
   if (ocs_num > 0) {
@@ -848,15 +941,15 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     uint32_t src_logical_port = 0, dst_logical_port = 0;
     std::string data_rate, link_delay;
     double error_rate;
-    topof >> src >> dst;
+    topo_data >> src >> dst;
     if (src >= node_num || dst >= node_num) {
       NS_ABORT_MSG("Topology link references invalid node id: " << src << " " << dst);
     }
     bool is_ocs_link = (node_type[src] == 3 || node_type[dst] == 3);
     if (is_ocs_link) {
-      topof >> src_logical_port >> dst_logical_port >> data_rate >> link_delay >> error_rate;
+      topo_data >> src_logical_port >> dst_logical_port >> data_rate >> link_delay >> error_rate;
     } else {
-      topof >> data_rate >> link_delay >> error_rate;
+      topo_data >> data_rate >> link_delay >> error_rate;
     }
     Ptr<Node> snode = n.Get(src), dnode = n.Get(dst);
     
@@ -912,6 +1005,42 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     nbr2if[dnode][snode].bw =
         DynamicCast<QbbNetDevice>(d.Get(1))->GetDataRate().GetBitRate();
 
+
+    // SimAI topology adapter -> old RdmaOcsController (post-device).
+    // Preserve the legacy global-controller mechanism: the controller receives
+    // topology bindings after NetDevices and link attributes are known.
+    // Do not feed GPU<->NVSwitch links into the RDMA/OCS controller; otherwise
+    // GPU endpoints have degree 2 and the old BuildRnicGroups() will not treat
+    // them as RNIC endpoints. Feed RDMA fabric links only: GPU/RNIC, EPS, OCS.
+    bool rdmaControllerLink = (node_type[src] != 2 && node_type[dst] != 2);
+    if (rdmaOcsController != 0 && rdmaControllerLink)
+      {
+        uint32_t srcIfIndex = nbr2if[snode][dnode].idx;
+        uint32_t dstIfIndex = nbr2if[dnode][snode].idx;
+
+        uint32_t rdmaSrcLogicalPort = is_ocs_link
+          ? src_logical_port
+          : static_cast<uint32_t>(100000 + srcIfIndex);
+        uint32_t rdmaDstLogicalPort = is_ocs_link
+          ? dst_logical_port
+          : static_cast<uint32_t>(100000 + dstIfIndex);
+
+        rdmaOcsController->AddPortBinding(src,
+                                          rdmaSrcLogicalPort,
+                                          srcIfIndex,
+                                          dst,
+                                          rdmaDstLogicalPort,
+                                          nbr2if[snode][dnode].delay,
+                                          nbr2if[snode][dnode].bw);
+        rdmaOcsController->AddPortBinding(dst,
+                                          rdmaDstLogicalPort,
+                                          dstIfIndex,
+                                          src,
+                                          rdmaSrcLogicalPort,
+                                          nbr2if[dnode][snode].delay,
+                                          nbr2if[dnode][snode].bw);
+      }
+
     
     if (is_ocs_link) {
       Ptr<QbbNetDevice> sdev = DynamicCast<QbbNetDevice>(d.Get(0));
@@ -942,7 +1071,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 
 
   if (ocs_num > 0) {
-    std::ofstream port_binding_out("ocs_port_bindings.txt");
+    std::ofstream port_binding_out("ocs_port_bindings_debug.txt");
     if (port_binding_out.is_open()) {
       ocs_dp_controller->DumpPortBindings(port_binding_out);
       port_binding_out.close();
@@ -965,6 +1094,56 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
       NS_LOG_UNCOND("[OCS WARNING] OCS nodes exist but neither schedule nor map is enabled");
     }
   }
+
+  if (ocs_num > 0 && ocs_stats_enable)
+    {
+      NS_LOG_UNCOND("[OCS STATS ENABLED]"
+                    << " start_us=" << ocs_stats_start_us
+                    << " interval_us=" << ocs_stats_interval_us);
+      Simulator::Schedule(MicroSeconds(ocs_stats_start_us),
+                          &DumpOcsStatsPeriodic);
+    }
+  if (ocs_num > 0 && ocs_schedule_enable)
+    {
+      /*
+       * Register OCS nodes with the old/global controller by inspecting node type.
+       * This avoids depending on the exact new-topology parser loop shape.
+       */
+      for (uint32_t i = 0; i < n.GetN(); ++i)
+        {
+          if (n.Get(i)->GetNodeType() == 3)
+            {
+              rdmaOcsController->AddOcsNode(i);
+            }
+        }
+
+      /*
+       * OcsDataPlaneController expands the new compact schedule into the old
+       * expanded format, then the old controller consumes that expanded file.
+       */
+      rdmaOcsController->LoadAndInstallOcsSchedule("ocs_schedule_expanded.txt");
+
+      if (rnic_gate_enable != 0)
+        {
+          rdmaOcsController->BuildRnicGroups();
+          rdmaOcsController->DumpRnicGroups();
+          rdmaOcsController->CompileRnicReachabilityWindows();
+          rdmaOcsController->DumpRnicReachabilityWindows();
+
+          std::cout << "[OLD RDMA OCS CONTROLLER COMPILED]"
+                    << " mode=" << rnic_gate_enable
+                    << " layer=" << (rnic_gate_enable == 1 ? "rnic" : "userspace")
+                    << " source=topology_adapter+expanded_schedule"
+                    << std::endl;
+        }
+      else
+        {
+          std::cout << "[RNIC GATE DISABLED]"
+                    << " mode=0 layer=default"
+                    << " source=old_global_controller"
+                    << std::endl;
+        }
+    }
 
   nic_rate = get_nic_rate(n);
   for (uint32_t i = 0; i < node_num; i++) {
@@ -1063,12 +1242,33 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 
       node->AggregateObject(rdma);
       rdma->Init();
+      rdma->SetInjectionMode(rnic_gate_enable);
+      rdma->ConfigureUserspaceTransport(32 * 1024, 256 * 1024);
       rdma->TraceConnectWithoutContext(
           "QpComplete", MakeBoundCallback(qp_finish, fct_output));
       rdma->TraceConnectWithoutContext("SendComplete",MakeBoundCallback(send_finish,send_output));
     }
   }
+
 #endif
+
+  if (ocs_num > 0 && ocs_schedule_enable)
+    {
+      if (rnic_gate_enable == 1)
+        {
+          rdmaOcsController->InstallRnicGateTablesToRdmaHw();
+          std::cout << "[RDMA GATE MODE] mode=1 layer=rnic" << std::endl;
+        }
+      else if (rnic_gate_enable == 2)
+        {
+          rdmaOcsController->InstallRnicGateTablesToUserspace();
+          std::cout << "[RDMA GATE MODE] mode=2 layer=userspace" << std::endl;
+        }
+      else
+        {
+          std::cout << "[RDMA GATE MODE] mode=0 layer=default" << std::endl;
+        }
+    }
 
   if (ack_high_prio)
     RdmaEgressQueue::ack_q_idx = 0;
