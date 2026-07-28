@@ -24,6 +24,7 @@
 #include <sstream>
 #include <time.h>
 #include <unordered_map>
+#include <utility>
 
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
@@ -43,8 +44,7 @@
 #include <ns3/switch-node.h>
 #include <ns3/nvswitch-node.h>
 #include <ns3/ocs-node.h>
-#include <ns3/ocs-data-plane-controller.h>
-#include <ns3/rdma-ocs-controller.h>
+#include <ns3/tdm-controller.h>
 #include <atomic>
 
 using namespace ns3;
@@ -94,8 +94,9 @@ uint32_t buffer_size = 16;
 
 uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server;
 uint32_t ocs_num = 0;
+uint32_t scale_out_plane_scheduler = 0; // 0=hash, 1=round-robin, 2=least-QP
 uint32_t ocs_schedule_enable = 0;
-uint32_t rnic_gate_enable = 0;
+uint32_t rdma_transport_mode = 0;
 uint64_t rnic_gate_margin_ns = 200000;
 uint64_t rnic_gate_burst_bytes = 65536;
 uint32_t ocs_stats_enable = 0;
@@ -131,6 +132,74 @@ uint64_t maxRtt, maxBdp;
 std::vector<Ipv4Address> serverAddress;
 
 std::unordered_map<uint32_t, unordered_map<uint32_t, uint16_t>> portNumber;
+
+struct RnicPortBinding {
+  uint32_t rnicPortId;
+  uint32_t physicalNicId;
+  uint32_t planeId;
+  uint32_t ifIndex;
+};
+
+struct ParsedEndpointPort {
+  uint32_t rnicPortId;
+  uint32_t physicalNicId;
+  uint32_t planeId;
+  bool hierarchical;
+};
+
+static uint32_t
+EncodeTopologyRnicPort(uint32_t physicalNicId, uint32_t planeId)
+{
+  if (physicalNicId > 0xffff || planeId > 0xffff)
+    {
+      NS_ABORT_MSG("NIC and plane IDs must fit in 16 bits: nic="
+                   << physicalNicId << " plane=" << planeId);
+    }
+  return (physicalNicId << 16) | planeId;
+}
+
+static uint32_t
+ParseStrictUint(const std::string& token, const char* fieldName)
+{
+  std::string::size_type consumed = 0;
+  unsigned long value = 0;
+  try
+    {
+      value = std::stoul(token, &consumed);
+    }
+  catch (const std::exception&)
+    {
+      NS_ABORT_MSG("Invalid " << fieldName << ": " << token);
+    }
+  if (consumed != token.size() || value > 0xffffffffUL)
+    {
+      NS_ABORT_MSG("Invalid " << fieldName << ": " << token);
+    }
+  return static_cast<uint32_t>(value);
+}
+
+static ParsedEndpointPort
+ParseEndpointPort(const std::string& token)
+{
+  std::string::size_type dash = token.find('-');
+  if (dash == std::string::npos)
+    {
+      uint32_t legacyPort = ParseStrictUint(token, "legacy RNIC port");
+      ParsedEndpointPort result = {legacyPort, 0, legacyPort, false};
+      return result;
+    }
+  if (dash == 0 || dash + 1 >= token.size() || token.find('-', dash + 1) != std::string::npos)
+    {
+      NS_ABORT_MSG("Invalid NIC-plane token: " << token << " (expected <nic>-<plane>)");
+    }
+
+  uint32_t nicId = ParseStrictUint(token.substr(0, dash), "NIC id");
+  uint32_t planeId = ParseStrictUint(token.substr(dash + 1), "plane id");
+  ParsedEndpointPort result = {
+    EncodeTopologyRnicPort(nicId, planeId), nicId, planeId, true
+  };
+  return result;
+}
 
 struct Interface {
   uint32_t idx;
@@ -610,6 +679,11 @@ bool ReadConf(string network_topo,string network_conf) {
         conf >> nic_total_pause_time;
       } else if (key.compare("PFC_OUTPUT_FILE") == 0) {
         conf >> pfc_output_file;
+      } else if (key.compare("SCALE_OUT_PLANE_SCHEDULER") == 0) {
+        conf >> scale_out_plane_scheduler;
+        if (scale_out_plane_scheduler > 2) {
+          NS_ABORT_MSG("SCALE_OUT_PLANE_SCHEDULER must be 0(hash), 1(round-robin), or 2(least-QP)");
+        }
       } else if (key.compare("OCS_SCHEDULE_ENABLE") == 0) {
         conf >> ocs_schedule_enable;
       } else if (key.compare("OCS_MAP_FILE") == 0) {
@@ -623,8 +697,12 @@ bool ReadConf(string network_topo,string network_conf) {
   } else if (key.compare("OCS_STATS_START_US") == 0) {
   conf >> ocs_stats_start_us;
 
-  } else if (key.compare("RNIC_GATE_ENABLE") == 0) {
-  conf >> rnic_gate_enable;
+  } else if (key.compare("RNIC_GATE_ENABLE") == 0 ||
+             key.compare("RDMA_TRANSPORT_MODE") == 0) {
+  conf >> rdma_transport_mode;
+  if (rdma_transport_mode > 2) {
+    NS_ABORT_MSG("RDMA transport mode must be 0(default), 1(RNIC), or 2(userspace)");
+  }
 
   } else if (key.compare("RNIC_GATE_MARGIN_NS") == 0) {
   conf >> rnic_gate_margin_ns;
@@ -895,15 +973,12 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 		}
 	}
 
-  Ptr<OcsDataPlaneController> ocs_dp_controller = CreateObject<OcsDataPlaneController>();
-  
-  Ptr<RdmaOcsController> rdmaOcsController = CreateObject<RdmaOcsController>();
-ocs_dp_controller->SetNodeContainer(n);
-    rdmaOcsController->SetNodeContainer(n);
-    rdmaOcsController->SetRnicGateExtraMarginNs(rnic_gate_margin_ns);
-    rdmaOcsController->SetRnicGateBurstBytes(rnic_gate_burst_bytes);
-for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
-    ocs_dp_controller->AddOcsNode(ocs_node_ids[i]);
+  Ptr<TdmController> tdmController = CreateObject<TdmController>();
+  tdmController->SetNodeContainer(n);
+  tdmController->SetRnicGateExtraMarginNs(rnic_gate_margin_ns);
+  tdmController->SetRnicGateBurstBytes(rnic_gate_burst_bytes);
+  for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
+    tdmController->AddOcsNode(ocs_node_ids[i]);
   }
   if (ocs_num > 0) {
     NS_LOG_UNCOND("[OCS TOPOLOGY] ocs_count=" << ocs_num);
@@ -936,22 +1011,124 @@ for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
 
   QbbHelper qbb;
   Ipv4AddressHelper ipv4;
+  std::vector<std::vector<RnicPortBinding>> pending_rnic_port_bindings(node_num);
+  std::vector<std::unordered_map<uint32_t, std::string>> host_interface_roles(node_num);
+
+  // Node-id lists were read with operator>>, so consume the remainder of that line
+  // before parsing each link as an independent record. Link records support:
+  //   legacy:   src dst rate delay error
+  //   explicit: src dst src_port dst_port rate delay error
+  // Every explicit GPU/NPU-side port may use <nic>-<plane>.  Scale-up and
+  // scale-out therefore share one interface identity namespace, while only
+  // scale-out interfaces are registered with the OCS gate controller.
+  std::string link_line;
+  if (nvswitch_num + switch_num + ocs_num > 0) {
+    std::getline(topo_data, link_line);
+  }
+
   for (uint32_t i = 0; i < link_num; i++) {
-    uint32_t src, dst;
+    if (!std::getline(topo_data, link_line)) {
+      NS_ABORT_MSG("Topology ended before all " << link_num << " links were read");
+    }
+
+    std::stringstream link_stream(link_line);
+    std::vector<std::string> link_fields;
+    std::string link_token;
+    while (link_stream >> link_token) {
+      link_fields.push_back(link_token);
+    }
+
+    if (link_fields.size() != 5 && link_fields.size() != 7) {
+      NS_ABORT_MSG("Invalid topology link record. Expected 5 legacy fields or 7 explicit-port fields, got "
+                   << link_fields.size() << ": " << link_line);
+    }
+
+    uint32_t src = ParseStrictUint(link_fields[0], "source node id");
+    uint32_t dst = ParseStrictUint(link_fields[1], "destination node id");
     uint32_t src_logical_port = 0, dst_logical_port = 0;
+    uint32_t src_physical_nic = 0, src_plane = 0;
+    uint32_t dst_physical_nic = 0, dst_plane = 0;
+    bool src_is_hierarchical_rnic = false;
+    bool dst_is_hierarchical_rnic = false;
     std::string data_rate, link_delay;
     double error_rate;
-    topo_data >> src >> dst;
+    bool has_explicit_ports = (link_fields.size() == 7);
+
     if (src >= node_num || dst >= node_num) {
       NS_ABORT_MSG("Topology link references invalid node id: " << src << " " << dst);
     }
+
     bool is_ocs_link = (node_type[src] == 3 || node_type[dst] == 3);
-    if (is_ocs_link) {
-      topo_data >> src_logical_port >> dst_logical_port >> data_rate >> link_delay >> error_rate;
-    } else {
-      topo_data >> data_rate >> link_delay >> error_rate;
+    if (is_ocs_link && !has_explicit_ports) {
+      NS_ABORT_MSG("OCS links require explicit src_port and dst_port fields: " << link_line);
     }
+
+    if (has_explicit_ports) {
+      bool src_is_host_endpoint = (node_type[src] == 0);
+      bool dst_is_host_endpoint = (node_type[dst] == 0);
+
+      if (src_is_host_endpoint) {
+        ParsedEndpointPort parsed = ParseEndpointPort(link_fields[2]);
+        src_logical_port = parsed.rnicPortId;
+        src_physical_nic = parsed.physicalNicId;
+        src_plane = parsed.planeId;
+        src_is_hierarchical_rnic = parsed.hierarchical;
+      } else {
+        src_logical_port = ParseStrictUint(link_fields[2], "source logical port");
+      }
+
+      if (dst_is_host_endpoint) {
+        ParsedEndpointPort parsed = ParseEndpointPort(link_fields[3]);
+        dst_logical_port = parsed.rnicPortId;
+        dst_physical_nic = parsed.physicalNicId;
+        dst_plane = parsed.planeId;
+        dst_is_hierarchical_rnic = parsed.hierarchical;
+      } else {
+        dst_logical_port = ParseStrictUint(link_fields[3], "destination logical port");
+      }
+
+      if (src_is_host_endpoint && src_is_hierarchical_rnic) {
+        const std::string role = node_type[dst] == 2 ? "scale-up" : "scale-out";
+        std::pair<std::unordered_map<uint32_t, std::string>::iterator, bool> inserted =
+          host_interface_roles[src].emplace(src_logical_port, role);
+        if (!inserted.second) {
+          NS_ABORT_MSG("GPU/NPU interface <nic>-<plane> is reused on node "
+                       << src << ": nic=" << src_physical_nic
+                       << " plane=" << src_plane
+                       << " existing_role=" << inserted.first->second
+                       << " new_role=" << role);
+        }
+      }
+      if (dst_is_host_endpoint && dst_is_hierarchical_rnic) {
+        const std::string role = node_type[src] == 2 ? "scale-up" : "scale-out";
+        std::pair<std::unordered_map<uint32_t, std::string>::iterator, bool> inserted =
+          host_interface_roles[dst].emplace(dst_logical_port, role);
+        if (!inserted.second) {
+          NS_ABORT_MSG("GPU/NPU interface <nic>-<plane> is reused on node "
+                       << dst << ": nic=" << dst_physical_nic
+                       << " plane=" << dst_plane
+                       << " existing_role=" << inserted.first->second
+                       << " new_role=" << role);
+        }
+      }
+
+      data_rate = link_fields[4];
+      link_delay = link_fields[5];
+      error_rate = std::stod(link_fields[6]);
+    } else {
+      data_rate = link_fields[2];
+      link_delay = link_fields[3];
+      error_rate = std::stod(link_fields[4]);
+    }
+
     Ptr<Node> snode = n.Get(src), dnode = n.Get(dst);
+
+    if ((src_is_hierarchical_rnic || dst_is_hierarchical_rnic) &&
+        (nbr2if[snode].count(dnode) != 0 || nbr2if[dnode].count(snode) != 0)) {
+      NS_ABORT_MSG("Parallel breakout links between the same endpoint and first-hop node are not supported "
+                   "by the current nbr2if map. Use a distinct per-plane first-hop switch node: "
+                   << src << " <-> " << dst);
+    }
     
     qbb.SetDeviceAttribute("DataRate", StringValue(data_rate));
     qbb.SetChannelAttribute("Delay", StringValue(link_delay));
@@ -1005,34 +1182,81 @@ for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
     nbr2if[dnode][snode].bw =
         DynamicCast<QbbNetDevice>(d.Get(1))->GetDataRate().GetBitRate();
 
+    // All explicit host ports use the same <nic>-<plane> identity namespace.
+    // Scale-up identities are logged for topology correctness but remain on the
+    // existing NVSwitch routing path.  Only scale-out identities become OCS-gated
+    // RNIC ports.
+    if (has_explicit_ports) {
+      if (node_type[src] == 0 && node_type[dst] == 2 && src_is_hierarchical_rnic) {
+        NS_LOG_UNCOND("[TOPO SCALEUP] node=" << src
+                      << " nic=" << src_physical_nic
+                      << " plane=" << src_plane
+                      << " interface_id=" << src_logical_port
+                      << " ifindex=" << nbr2if[snode][dnode].idx);
+      }
+      if (node_type[dst] == 0 && node_type[src] == 2 && dst_is_hierarchical_rnic) {
+        NS_LOG_UNCOND("[TOPO SCALEUP] node=" << dst
+                      << " nic=" << dst_physical_nic
+                      << " plane=" << dst_plane
+                      << " interface_id=" << dst_logical_port
+                      << " ifindex=" << nbr2if[dnode][snode].idx);
+      }
+      if (node_type[src] == 0 && node_type[dst] != 2) {
+        RnicPortBinding binding = {
+          src_logical_port, src_physical_nic, src_plane, nbr2if[snode][dnode].idx
+        };
+        pending_rnic_port_bindings[src].push_back(binding);
+        if (src_is_hierarchical_rnic) {
+          NS_LOG_UNCOND("[TOPO RNIC] node=" << src
+                        << " nic=" << src_physical_nic
+                        << " plane=" << src_plane
+                        << " rnic_port=" << src_logical_port
+                        << " ifindex=" << binding.ifIndex);
+        }
+      }
+      if (node_type[dst] == 0 && node_type[src] != 2) {
+        RnicPortBinding binding = {
+          dst_logical_port, dst_physical_nic, dst_plane, nbr2if[dnode][snode].idx
+        };
+        pending_rnic_port_bindings[dst].push_back(binding);
+        if (dst_is_hierarchical_rnic) {
+          NS_LOG_UNCOND("[TOPO RNIC] node=" << dst
+                        << " nic=" << dst_physical_nic
+                        << " plane=" << dst_plane
+                        << " rnic_port=" << dst_logical_port
+                        << " ifindex=" << binding.ifIndex);
+        }
+      }
+    }
 
-    // SimAI topology adapter -> old RdmaOcsController (post-device).
+
+    // SimAI topology adapter -> central TdmController (post-device).
     // Preserve the legacy global-controller mechanism: the controller receives
     // topology bindings after NetDevices and link attributes are known.
-    // Do not feed GPU<->NVSwitch links into the RDMA/OCS controller; otherwise
-    // GPU endpoints have degree 2 and the old BuildRnicGroups() will not treat
-    // them as RNIC endpoints. Feed RDMA fabric links only: GPU/RNIC, EPS, OCS.
+    // Do not feed GPU<->NVSwitch links into the RDMA/OCS controller.
+    // The controller receives only scale-out endpoint ports, EPS links, and OCS links;
+    // each GPU scale-out port is compiled as an independent (node, rnicPort) endpoint.
     bool rdmaControllerLink = (node_type[src] != 2 && node_type[dst] != 2);
-    if (rdmaOcsController != 0 && rdmaControllerLink)
+    if (tdmController != 0 && rdmaControllerLink)
       {
         uint32_t srcIfIndex = nbr2if[snode][dnode].idx;
         uint32_t dstIfIndex = nbr2if[dnode][snode].idx;
 
-        uint32_t rdmaSrcLogicalPort = is_ocs_link
+        uint32_t rdmaSrcLogicalPort = has_explicit_ports
           ? src_logical_port
           : static_cast<uint32_t>(100000 + srcIfIndex);
-        uint32_t rdmaDstLogicalPort = is_ocs_link
+        uint32_t rdmaDstLogicalPort = has_explicit_ports
           ? dst_logical_port
           : static_cast<uint32_t>(100000 + dstIfIndex);
 
-        rdmaOcsController->AddPortBinding(src,
+        tdmController->AddPortBinding(src,
                                           rdmaSrcLogicalPort,
                                           srcIfIndex,
                                           dst,
                                           rdmaDstLogicalPort,
                                           nbr2if[snode][dnode].delay,
                                           nbr2if[snode][dnode].bw);
-        rdmaOcsController->AddPortBinding(dst,
+        tdmController->AddPortBinding(dst,
                                           rdmaDstLogicalPort,
                                           dstIfIndex,
                                           src,
@@ -1040,21 +1264,6 @@ for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
                                           nbr2if[dnode][snode].delay,
                                           nbr2if[dnode][snode].bw);
       }
-
-    
-    if (is_ocs_link) {
-      Ptr<QbbNetDevice> sdev = DynamicCast<QbbNetDevice>(d.Get(0));
-      Ptr<QbbNetDevice> ddev = DynamicCast<QbbNetDevice>(d.Get(1));
-      uint64_t sdelay = DynamicCast<QbbChannel>(sdev->GetChannel())->GetDelay().GetTimeStep();
-      uint64_t ddelay = DynamicCast<QbbChannel>(ddev->GetChannel())->GetDelay().GetTimeStep();
-      uint64_t sbw = sdev->GetDataRate().GetBitRate();
-      uint64_t dbw = ddev->GetDataRate().GetBitRate();
-
-      ocs_dp_controller->AddPortBinding(src, src_logical_port, sdev->GetIfIndex(),
-                                        dst, dst_logical_port, sdelay, sbw);
-      ocs_dp_controller->AddPortBinding(dst, dst_logical_port, ddev->GetIfIndex(),
-                                        src, src_logical_port, ddelay, dbw);
-    }
 
     char ipstring[16];
     sprintf(ipstring, "10.%d.%d.0", i / 254 + 1, i % 254 + 1);
@@ -1073,7 +1282,7 @@ for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
   if (ocs_num > 0) {
     std::ofstream port_binding_out("ocs_port_bindings_debug.txt");
     if (port_binding_out.is_open()) {
-      ocs_dp_controller->DumpPortBindings(port_binding_out);
+      tdmController->DumpPortBindings(port_binding_out);
       port_binding_out.close();
     }
 
@@ -1081,15 +1290,15 @@ for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
       if (ocs_schedule_file.empty()) {
         NS_ABORT_MSG("OCS_SCHEDULE_ENABLE=1 but OCS_SCHEDULE_FILE is empty");
       }
-      ocs_dp_controller->LoadCompactSchedule(ocs_schedule_file);
+      tdmController->LoadCompactSchedule(ocs_schedule_file);
 
       std::ofstream expanded_out("ocs_schedule_expanded.txt");
       if (expanded_out.is_open()) {
-        ocs_dp_controller->DumpExpandedSchedule(expanded_out);
+        tdmController->DumpExpandedSchedule(expanded_out);
         expanded_out.close();
       }
     } else if (!ocs_map_file.empty()) {
-      ocs_dp_controller->LoadStaticMap(ocs_map_file);
+      tdmController->LoadStaticMap(ocs_map_file);
     } else {
       NS_LOG_UNCOND("[OCS WARNING] OCS nodes exist but neither schedule nor map is enabled");
     }
@@ -1105,43 +1314,19 @@ for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
     }
   if (ocs_num > 0 && ocs_schedule_enable)
     {
-      /*
-       * Register OCS nodes with the old/global controller by inspecting node type.
-       * This avoids depending on the exact new-topology parser loop shape.
-       */
-      for (uint32_t i = 0; i < n.GetN(); ++i)
+      if (rdma_transport_mode != 0)
         {
-          if (n.Get(i)->GetNodeType() == 3)
-            {
-              rdmaOcsController->AddOcsNode(i);
-            }
-        }
-
-      /*
-       * OcsDataPlaneController expands the new compact schedule into the old
-       * expanded format, then the old controller consumes that expanded file.
-       */
-      rdmaOcsController->LoadAndInstallOcsSchedule("ocs_schedule_expanded.txt");
-
-      if (rnic_gate_enable != 0)
-        {
-          rdmaOcsController->BuildRnicGroups();
-          rdmaOcsController->DumpRnicGroups();
-          rdmaOcsController->CompileRnicReachabilityWindows();
-          rdmaOcsController->DumpRnicReachabilityWindows();
-
-          std::cout << "[OLD RDMA OCS CONTROLLER COMPILED]"
-                    << " mode=" << rnic_gate_enable
-                    << " layer=" << (rnic_gate_enable == 1 ? "rnic" : "userspace")
-                    << " source=topology_adapter+expanded_schedule"
+          tdmController->BuildRnicGroups();
+          tdmController->CompileRnicReachabilityWindows();
+          std::cout << "[TDM CONTROLLER READY]"
+                    << " mode=" << rdma_transport_mode
+                    << " layer=" << (rdma_transport_mode == 1 ? "rnic" : "userspace")
+                    << " source=topology+compact_schedule"
                     << std::endl;
         }
       else
         {
-          std::cout << "[RNIC GATE DISABLED]"
-                    << " mode=0 layer=default"
-                    << " source=old_global_controller"
-                    << std::endl;
+          std::cout << "[RNIC GATE DISABLED] mode=0 layer=default" << std::endl;
         }
     }
 
@@ -1199,6 +1384,19 @@ for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
 		}
   }
 
+  bool topology_has_multiplane_endpoint = false;
+  for (uint32_t i = 0; i < pending_rnic_port_bindings.size(); ++i) {
+    if (pending_rnic_port_bindings[i].size() > 1) {
+      topology_has_multiplane_endpoint = true;
+      break;
+    }
+  }
+  if (topology_has_multiplane_endpoint) {
+    NS_LOG_UNCOND("[MULTIPLANE ENABLED] scale_out_scheduler="
+                  << scale_out_plane_scheduler
+                  << " ack_policy=same-plane");
+  }
+
 #if ENABLE_QP
   FILE *fct_output = fopen(fct_output_file.c_str(), "w");
   FILE *send_output = fopen(send_output_file.c_str(), "w");
@@ -1232,6 +1430,7 @@ for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
       rdmaHw->SetAttribute("DctcpRateAI",
                            DataRateValue(DataRate(dctcp_rate_ai)));
       rdmaHw->SetAttribute("GPUsPerServer", UintegerValue(gpus_per_server));
+      rdmaHw->SetAttribute("ScaleOutPlaneScheduler", UintegerValue(scale_out_plane_scheduler));
       rdmaHw->SetPintSmplThresh(pint_prob);
       rdmaHw->SetAttribute("TotalPauseTimes",
                            UintegerValue(nic_total_pause_time));
@@ -1242,8 +1441,14 @@ for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
 
       node->AggregateObject(rdma);
       rdma->Init();
-      rdma->SetInjectionMode(rnic_gate_enable);
-      rdma->ConfigureUserspaceTransport(32 * 1024, 256 * 1024);
+      for (const auto &binding : pending_rnic_port_bindings[i]) {
+        rdmaHw->RegisterRnicInterface(binding.rnicPortId,
+                                      binding.physicalNicId,
+                                      binding.planeId,
+                                      binding.ifIndex);
+      }
+      rdma->SetInjectionMode(rdma_transport_mode);
+      rdma->ConfigureTransport(32 * 1024, 256 * 1024);
       rdma->TraceConnectWithoutContext(
           "QpComplete", MakeBoundCallback(qp_finish, fct_output));
       rdma->TraceConnectWithoutContext("SendComplete",MakeBoundCallback(send_finish,send_output));
@@ -1254,20 +1459,12 @@ for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
 
   if (ocs_num > 0 && ocs_schedule_enable)
     {
-      if (rnic_gate_enable == 1)
-        {
-          rdmaOcsController->InstallRnicGateTablesToRdmaHw();
-          std::cout << "[RDMA GATE MODE] mode=1 layer=rnic" << std::endl;
-        }
-      else if (rnic_gate_enable == 2)
-        {
-          rdmaOcsController->InstallRnicGateTablesToUserspace();
-          std::cout << "[RDMA GATE MODE] mode=2 layer=userspace" << std::endl;
-        }
-      else
-        {
-          std::cout << "[RDMA GATE MODE] mode=0 layer=default" << std::endl;
-        }
+      tdmController->InstallRdmaGateTables(rdma_transport_mode);
+      std::cout << "[RDMA GATE MODE] mode=" << rdma_transport_mode
+                << " layer="
+                << (rdma_transport_mode == 1 ? "rnic" :
+                    (rdma_transport_mode == 2 ? "userspace" : "default"))
+                << std::endl;
     }
 
   if (ack_high_prio)
