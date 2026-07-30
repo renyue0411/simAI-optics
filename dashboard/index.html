@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Optics-SimAI</title>
+  <link rel="icon" href="assets/logo.png" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <img src="assets/logo.png" alt="logo" />
+        <div>
+          <h1>DASHBOARD</h1>
+        </div>
+      </div>
+      <div class="sidebar-toolbar">
+        <input id="experimentSearch" type="search" placeholder="Search experiments" />
+        <button id="refreshExperiments" class="icon-button" title="Refresh">↻</button>
+      </div>
+      <div id="runsPath" class="runs-path"></div>
+      <nav id="experimentList" class="experiment-list" aria-label="Experiment list"></nav>
+    </aside>
+
+    <main class="main-panel">
+      <header class="main-header">
+        <div>
+          <p class="eyebrow">Selected Experiment</p>
+          <h2 id="experimentTitle">Loading…</h2>
+          <p id="experimentMeta" class="subtle"></p>
+        </div>
+        <div id="resultBadge" class="status-badge neutral">Unknown</div>
+      </header>
+
+      <section id="warningPanel" class="warning-panel hidden"></section>
+
+      <section class="section-block">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Setup</p>
+            <h3>Experiment Configuration</h3>
+          </div>
+        </div>
+        <div id="configCards" class="metric-grid"></div>
+        <div id="resultCards" class="result-grid"></div>
+      </section>
+
+      <section class="section-block">
+        <div class="section-heading with-actions">
+          <div>
+            <p class="eyebrow">Network</p>
+            <h3>Hierarchical Topology</h3>
+          </div>
+          <div class="action-row">
+            <button id="topologyReset" class="secondary-button">Reset View</button>
+          </div>
+        </div>
+        <div class="topology-legend">
+          <span><i class="dot gpu"></i>GPU</span>
+          <span><i class="dot nvswitch"></i>NVSwitch</span>
+          <span><i class="dot leaf-ocs"></i>Leaf OCS</span>
+          <span><i class="dot core-ocs"></i>Core OCS</span>
+          <span><i class="dot eps"></i>EPS</span>
+          <span class="legend-divider"></span>
+          <span><i class="line-key scale-up"></i>Scale-up link</span>
+          <span><i class="line-key scale-out-plane0"></i>Scale-out plane 0</span>
+          <span><i class="line-key scale-out-plane1"></i>Scale-out plane 1</span>
+        </div>
+        <div id="topologyCanvas" class="topology-canvas"></div>
+      </section>
+
+      <section class="section-block">
+        <div class="section-heading with-actions">
+          <div>
+            <p class="eyebrow">Performance Evaluation</p>
+            <h3>Per-flow Throughput Timeline</h3>
+            <p id="throughputNote" class="subtle"></p>
+          </div>
+          <div class="action-row flow-controls">
+            <select id="sportFilter"><option value="all">All sports</option></select>
+            <input id="flowSearch" type="search" placeholder="src, dst, or flow id" />
+            <select id="flowLimit">
+              <option value="24">Top 24</option>
+              <option value="48">Top 48</option>
+              <option value="96">Top 96</option>
+              <option value="all">All flows</option>
+            </select>
+            <button id="flowShowAll" class="secondary-button">Show All</button>
+          </div>
+        </div>
+        <div id="throughputChart" class="chart-panel"></div>
+        <div id="flowLegend" class="flow-legend"></div>
+        <div class="table-toolbar">
+          <input id="flowTableSearch" type="search" placeholder="Filter completion table" />
+          <span id="flowCount" class="subtle"></span>
+        </div>
+        <div class="table-wrap tall">
+          <table>
+            <thead>
+              <tr>
+                <th data-sort="src">Src</th>
+                <th data-sort="dst">Dst</th>
+                <th data-sort="sport">Sport</th>
+                <th data-sort="size_bytes">Size</th>
+                <th data-sort="start_us">Start (µs)</th>
+                <th data-sort="fct_us">FCT (µs)</th>
+                <th data-sort="avg_gbps">Avg Gbps</th>
+                <th data-sort="slowdown">Slowdown</th>
+              </tr>
+            </thead>
+            <tbody id="flowTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="two-column-grid">
+        <article class="section-block compact-block">
+          <div class="section-heading with-actions">
+            <div>
+              <p class="eyebrow">Optical Fabric</p>
+              <h3>OCS Schedule</h3>
+            </div>
+            <select id="ocsSelector"></select>
+          </div>
+          <div id="ocsScheduleSummary" class="inline-stats"></div>
+          <div class="table-wrap medium">
+            <table>
+              <thead><tr><th>Slice</th><th>Port Pairings</th></tr></thead>
+              <tbody id="ocsScheduleBody"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="section-block compact-block">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Transport Control</p>
+              <h3>Injection Window Table</h3>
+            </div>
+          </div>
+          <div id="injectionSummary" class="inline-stats"></div>
+          <div id="injectionExactNotice" class="subtle notice"></div>
+          <div class="table-wrap medium">
+            <table>
+              <thead id="injectionHead"></thead>
+              <tbody id="injectionBody"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section class="two-column-grid">
+        <article class="section-block compact-block">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Optical Telemetry</p>
+              <h3>OCS Stats</h3>
+            </div>
+          </div>
+          <div class="table-wrap medium">
+            <table>
+              <thead>
+                <tr><th>OCS</th><th>fwd pkts</th><th>fwd bytes</th><th>sw drops</th><th>no-circ drops</th></tr>
+              </thead>
+              <tbody id="ocsStatsBody"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="section-block compact-block">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Transport Telemetry</p>
+              <h3>RNIC Retransmission Summary</h3>
+            </div>
+          </div>
+          <div class="table-wrap medium">
+            <table>
+              <thead id="retransHead"></thead>
+              <tbody id="retransBody"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <footer>
+        <span>Local-only dashboard · data read from experiments/runs</span>
+      </footer>
+    </main>
+  </div>
+  <div id="loadingOverlay" class="loading-overlay"><div class="spinner"></div><span>Loading experiment…</span></div>
+  <script src="app.js"></script>
+</body>
+</html>
