@@ -888,30 +888,44 @@ def parse_experiment(run_dir: Path, experiments_root: Path) -> dict[str, Any]:
     warnings: list[str] = []
 
     if topology.get("partial"):
-        warnings.append("Topology snapshot missing; Server/NVSwitch layout unavailable.")
+        warnings.append(
+            "The experiment does not include a topology snapshot. "
+            "The topology was partially rebuilt from ocs_port_bindings_debug.txt, "
+            "so Server and NVSwitch information may be missing."
+        )
 
     if not exact_windows["exact"]:
-        warnings.append("Exact Injection Window data unavailable.")
+        warnings.append(
+            "Exact Injection Window details were not exported. "
+            "Only gate-table slot counts and Mode 2 WR summaries are available."
+        )
 
     if safe_int(conf.get("OCS_STATS_ENABLE"), 0) == 0:
-        warnings.append("OCS statistics disabled.")
+        warnings.append(
+            "OCS statistics were disabled for this experiment."
+        )
     elif not log.get("ocs_stats"):
-        warnings.append("No [OCS STATS] entries found.")
+        warnings.append(
+            "OCS statistics were enabled, but no [OCS STATS] entries were found in simulator.log."
+        )
 
     if not log.get("retransmission"):
-        warnings.append("RNIC retransmission data unavailable.")
+        warnings.append(
+            "No RNIC retransmission telemetry was found. "
+            "The dashboard cannot determine whether retransmissions were zero or not recorded."
+        )
 
-        throughput = build_flow_throughput(log.get("flow_rx", []), fct)
+    throughput = build_flow_throughput(log.get("flow_rx", []), fct)
 
-        result = manifest.get("result", {}) if isinstance(manifest.get("result"), dict) else {}
-        result_summary = {
-            "status": result.get("status", "unknown"),
-            "return_code": result.get("return_code"),
-            "wall_duration_seconds": result.get("duration_seconds"),
-            "finished_at_utc": result.get("finished_at_utc"),
-            **log.get("completion", {}),
-            **end_to_end.get("summary", {}),
-        }
+    result = manifest.get("result", {}) if isinstance(manifest.get("result"), dict) else {}
+    result_summary = {
+        "status": result.get("status", "unknown"),
+        "return_code": result.get("return_code"),
+        "wall_duration_seconds": result.get("duration_seconds"),
+        "finished_at_utc": result.get("finished_at_utc"),
+        **log.get("completion", {}),
+        **end_to_end.get("summary", {}),
+    }
 
     return {
         "name": run_dir.name,
