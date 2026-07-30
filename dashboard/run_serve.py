@@ -886,28 +886,32 @@ def parse_experiment(run_dir: Path, experiments_root: Path) -> dict[str, Any]:
     }
 
     warnings: list[str] = []
+
     if topology.get("partial"):
-        warnings.append("实验目录未包含 topology 快照；当前拓扑由 ocs_port_bindings_debug.txt 部分重建，Server/NVSwitch 层级不可用。")
+        warnings.append("Topology snapshot missing; Server/NVSwitch layout unavailable.")
+
     if not exact_windows["exact"]:
-        warnings.append("实验目录未导出精确 Injection Window 明细；当前仅展示 gate table slot 数和 Mode 2 的 WR 汇总。")
+        warnings.append("Exact Injection Window data unavailable.")
+
     if safe_int(conf.get("OCS_STATS_ENABLE"), 0) == 0:
-        warnings.append("OCS_STATS_ENABLE=0，本实验没有 OCS Stats 时间序列或最终统计。")
+        warnings.append("OCS statistics disabled.")
     elif not log.get("ocs_stats"):
-        warnings.append("OCS Stats 已启用，但 simulator.log 中未找到 [OCS STATS]。")
+        warnings.append("No [OCS STATS] entries found.")
+
     if not log.get("retransmission"):
-        warnings.append("未找到 RNIC retransmission telemetry；无法区分“重传为 0”和“未记录重传统计”。")
+        warnings.append("RNIC retransmission data unavailable.")
 
-    throughput = build_flow_throughput(log.get("flow_rx", []), fct)
+        throughput = build_flow_throughput(log.get("flow_rx", []), fct)
 
-    result = manifest.get("result", {}) if isinstance(manifest.get("result"), dict) else {}
-    result_summary = {
-        "status": result.get("status", "unknown"),
-        "return_code": result.get("return_code"),
-        "wall_duration_seconds": result.get("duration_seconds"),
-        "finished_at_utc": result.get("finished_at_utc"),
-        **log.get("completion", {}),
-        **end_to_end.get("summary", {}),
-    }
+        result = manifest.get("result", {}) if isinstance(manifest.get("result"), dict) else {}
+        result_summary = {
+            "status": result.get("status", "unknown"),
+            "return_code": result.get("return_code"),
+            "wall_duration_seconds": result.get("duration_seconds"),
+            "finished_at_utc": result.get("finished_at_utc"),
+            **log.get("completion", {}),
+            **end_to_end.get("summary", {}),
+        }
 
     return {
         "name": run_dir.name,
@@ -1024,7 +1028,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve the local SimAI experiment dashboard")
     parser.add_argument("--runs-dir", type=Path, default=DEFAULT_RUNS_DIR, help="Path containing experiment run directories")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--open", action="store_true", help="Open the dashboard in the default browser")
     return parser.parse_args()

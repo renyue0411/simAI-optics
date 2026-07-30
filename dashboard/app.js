@@ -145,8 +145,8 @@ function renderResultCards() {
   const flows = state.data.flows?.summary || {};
   const cards = [
     ['Status', result.status],
-    ['Wall Runtime', result.wall_duration_seconds !== undefined ? `${fmt(result.wall_duration_seconds, 3)} s` : '—'],
-    ['Job Makespan', result.all_passes_finished_ms !== undefined ? `${fmt(result.all_passes_finished_ms, 3)} ms` : result.total_time_us !== undefined ? `${fmt(result.total_time_us / 1000, 3)} ms` : '—'],
+    ['Runtime', result.wall_duration_seconds !== undefined ? `${fmt(result.wall_duration_seconds, 3)} s` : '—'],
+    ['Completion Time', result.all_passes_finished_ms !== undefined ? `${fmt(result.all_passes_finished_ms, 3)} ms` : result.total_time_us !== undefined ? `${fmt(result.total_time_us / 1000, 3)} ms` : '—'],
     ['Streams', result.streams_finished !== undefined ? `${result.streams_finished}/${result.streams_injected ?? '—'}` : '—'],
     ['Flows', flows.count ?? '—'],
     ['Total Flow Bytes', flows.total_bytes_human ?? '—'],
@@ -770,7 +770,7 @@ function renderSelectedSchedule() {
 function renderInjection() {
   const injection = state.data.injection || {};
   const mode = Number(injection.mode || 0);
-  const modeLabel = {0:'Default RDMA',1:'RNIC Gate',2:'User-space Gate'}[mode] || 'Unknown';
+  const modeLabel = {0:'Default RDMA',1:'RNIC',2:'User-space'}[mode] || 'Unknown';
   const wr = injection.wr?.totals || {};
   const stats = [
     ['Mode', `${mode} · ${modeLabel}`],
