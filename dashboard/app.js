@@ -297,11 +297,8 @@ function defaultTopologyPositions(nodes, servers, links) {
 
   [...hierarchy.tiers.keys()].sort((a, b) => a - b).forEach(depth => {
     const row = hierarchy.tiers.get(depth);
-    row.sort((a, b) => {
-      const scoreA = scoreFromNeighbors(a, depth - 1);
-      const scoreB = scoreFromNeighbors(b, depth - 1);
-      return scoreA - scoreB || Number(a.id) - Number(b.id);
-    });
+    // Keep switches in deterministic numeric order within each inferred tier.
+    row.sort((a, b) => Number(a.id) - Number(b.id));
     const margin = 110;
     const step = row.length <= 1 ? 0 : (width - margin * 2) / (row.length - 1);
     const y = scaleOutBottom - (depth - 1) * tierGap;
@@ -494,7 +491,7 @@ function renderTopology() {
     const scope = isScaleUp ? 'scale-up-link' : 'scale-out-link';
     const plane = `plane-${inferLinkPlane(link)}`;
     const title = `${link.source}:${link.source_port ?? '—'} ↔ ${link.target}:${link.target_port ?? '—'} · ${link.bandwidth ?? ''} ${link.delay ?? ''}`;
-    return `<line class="topology-link ${scope} ${plane}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"><title>${escapeHtml(title)}</title></line>`;
+    return `<line class="topology-link ${scope} ${plane}" data-source-node="${link.source}" data-target-node="${link.target}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"><title>${escapeHtml(title)}</title></line>`;
   }).join('');
 
   const tierLabels = [...scaleOutHierarchy.tiers.keys()]
@@ -542,49 +539,204 @@ function svgPoint(svg, event) {
 
 function bindTopologyInteractions() {
   const svg = $('topologySvg');
-  if (!svg) return;
+  const viewport = $('topologyViewport');
+  if (!svg || !viewport) return;
+
+  const applyViewportTransform = () => {
+    viewport.setAttribute(
+      'transform',
+      `translate(${state.topology.tx},${state.topology.ty}) scale(${state.topology.scale})`
+    );
+  };
+
+  const clientToSvg = (clientX, clientY) => {
+    const point = svg.createSVGPoint();
+    point.x = clientX;
+    point.y = clientY;
+
+    const ctm = svg.getScreenCTM();
+    return ctm
+      ? point.matrixTransform(ctm.inverse())
+      : { x: clientX, y: clientY };
+  };
+
+  const updateDraggedNode = nodeId => {
+    const position = state.topology.positions[nodeId];
+    if (!position) return;
+
+    const node = [...svg.querySelectorAll('.topology-node[data-node-id]')]
+      .find(item => Number(item.dataset.nodeId) === nodeId);
+
+    if (node) {
+      node.setAttribute(
+        'transform',
+        `translate(${position.x},${position.y})`
+      );
+    }
+
+    svg.querySelectorAll(
+      '.topology-link[data-source-node][data-target-node]'
+    ).forEach(line => {
+      const sourceId = Number(line.dataset.sourceNode);
+      const targetId = Number(line.dataset.targetNode);
+
+      if (sourceId !== nodeId && targetId !== nodeId) return;
+
+      const source = state.topology.positions[sourceId];
+      const target = state.topology.positions[targetId];
+      if (!source || !target) return;
+
+      line.setAttribute('x1', source.x);
+      line.setAttribute('y1', source.y);
+      line.setAttribute('x2', target.x);
+      line.setAttribute('y2', target.y);
+    });
+  };
+
+  let activePointerId = null;
+  let draggedNodeId = null;
+  let draggedElement = null;
+  let panPoint = null;
+  let pendingDragPoint = null;
+  let dragFrame = 0;
+
+  const flushDrag = () => {
+    dragFrame = 0;
+
+    if (draggedNodeId === null || !pendingDragPoint) return;
+
+    const pointer = clientToSvg(
+      pendingDragPoint.clientX,
+      pendingDragPoint.clientY
+    );
+    pendingDragPoint = null;
+
+    state.topology.positions[draggedNodeId] = {
+      x: (pointer.x - state.topology.tx) / state.topology.scale,
+      y: (pointer.y - state.topology.ty) / state.topology.scale,
+    };
+
+    updateDraggedNode(draggedNodeId);
+  };
+
+  // Zoom without rebuilding the SVG.
   svg.addEventListener('wheel', event => {
     event.preventDefault();
+
+    const cursor = clientToSvg(event.clientX, event.clientY);
+    const oldScale = state.topology.scale;
     const factor = event.deltaY < 0 ? 1.1 : 0.9;
-    state.topology.scale = Math.max(0.35, Math.min(3.2, state.topology.scale * factor));
-    renderTopology();
+    const newScale = Math.max(
+      0.35,
+      Math.min(3.2, oldScale * factor)
+    );
+
+    if (newScale === oldScale) return;
+
+    const contentX = (cursor.x - state.topology.tx) / oldScale;
+    const contentY = (cursor.y - state.topology.ty) / oldScale;
+
+    state.topology.scale = newScale;
+    state.topology.tx = cursor.x - contentX * newScale;
+    state.topology.ty = cursor.y - contentY * newScale;
+
+    applyViewportTransform();
   }, { passive: false });
 
-  svg.querySelectorAll('.topology-node').forEach(node => {
-    node.addEventListener('pointerdown', event => {
+  svg.addEventListener('pointerdown', event => {
+    if (event.button !== 0) return;
+
+    const node = event.target.closest?.('.topology-node');
+
+    activePointerId = event.pointerId;
+    svg.setPointerCapture(event.pointerId);
+    event.preventDefault();
+
+    if (node) {
       event.stopPropagation();
-      node.setPointerCapture(event.pointerId);
-      state.topology.draggingNode = Number(node.dataset.nodeId);
-    });
-    node.addEventListener('pointermove', event => {
-      if (state.topology.draggingNode === null) return;
-      const p = svgPoint(svg, event);
-      state.topology.positions[state.topology.draggingNode] = {
-        x: (p.x - state.topology.tx) / state.topology.scale,
-        y: (p.y - state.topology.ty) / state.topology.scale,
+
+      draggedNodeId = Number(node.dataset.nodeId);
+      draggedElement = node;
+      state.topology.draggingNode = draggedNodeId;
+
+      draggedElement.classList.add('is-dragging');
+      pendingDragPoint = {
+        clientX: event.clientX,
+        clientY: event.clientY,
       };
-      renderTopology();
-    });
-    node.addEventListener('pointerup', () => { state.topology.draggingNode = null; });
+      return;
+    }
+
+    state.topology.panning = true;
+    panPoint = clientToSvg(event.clientX, event.clientY);
   });
 
-  svg.addEventListener('pointerdown', event => {
-    if (event.target.closest('.topology-node')) return;
-    state.topology.panning = true;
-    state.topology.lastX = event.clientX;
-    state.topology.lastY = event.clientY;
-    svg.setPointerCapture(event.pointerId);
-  });
   svg.addEventListener('pointermove', event => {
-    if (!state.topology.panning) return;
-    state.topology.tx += event.clientX - state.topology.lastX;
-    state.topology.ty += event.clientY - state.topology.lastY;
-    state.topology.lastX = event.clientX;
-    state.topology.lastY = event.clientY;
-    const viewport = $('topologyViewport');
-    if (viewport) viewport.setAttribute('transform', `translate(${state.topology.tx},${state.topology.ty}) scale(${state.topology.scale})`);
+    if (event.pointerId !== activePointerId) return;
+
+    if (draggedNodeId !== null) {
+      pendingDragPoint = {
+        clientX: event.clientX,
+        clientY: event.clientY,
+      };
+
+      // Limit DOM updates to one per animation frame.
+      if (!dragFrame) {
+        dragFrame = requestAnimationFrame(flushDrag);
+      }
+      return;
+    }
+
+    if (!state.topology.panning || !panPoint) return;
+
+    const current = clientToSvg(event.clientX, event.clientY);
+
+    state.topology.tx += current.x - panPoint.x;
+    state.topology.ty += current.y - panPoint.y;
+    panPoint = current;
+
+    applyViewportTransform();
   });
-  svg.addEventListener('pointerup', () => { state.topology.panning = false; });
+
+  const finishPointer = event => {
+    if (
+      activePointerId === null ||
+      event.pointerId !== activePointerId
+    ) {
+      return;
+    }
+
+    if (dragFrame) {
+      cancelAnimationFrame(dragFrame);
+      flushDrag();
+    }
+
+    const shouldRefreshBounds = draggedNodeId !== null;
+
+    draggedElement?.classList.remove('is-dragging');
+
+    draggedNodeId = null;
+    draggedElement = null;
+    pendingDragPoint = null;
+    panPoint = null;
+
+    state.topology.draggingNode = null;
+    state.topology.panning = false;
+
+    if (svg.hasPointerCapture(event.pointerId)) {
+      svg.releasePointerCapture(event.pointerId);
+    }
+
+    activePointerId = null;
+
+    // Recalculate Server and Scale-up/Scale-out boxes after dropping.
+    if (shouldRefreshBounds) {
+      renderTopology();
+    }
+  };
+
+  svg.addEventListener('pointerup', finishPointer);
+  svg.addEventListener('pointercancel', finishPointer);
 }
 
 function initializeFlowFilters() {

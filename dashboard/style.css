@@ -177,3 +177,20 @@ img[src$="logo.png"] {
   box-sizing: border-box;
   object-fit: contain;
 }
+
+
+/* Smooth topology interaction */
+.topology-node {
+  touch-action: none;
+  will-change: transform;
+}
+
+.topology-node.is-dragging {
+  cursor: grabbing;
+}
+
+.topology-link,
+.topology-domain-group,
+.server-domain-group {
+  pointer-events: none;
+}
