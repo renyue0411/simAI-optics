@@ -94,7 +94,7 @@ uint32_t buffer_size = 16;
 
 uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server;
 uint32_t ocs_num = 0;
-uint32_t scale_out_plane_scheduler = 0; // 0=hash, 1=round-robin, 2=least-QP
+uint32_t scale_out_plane_scheduler = 0; // 0=hash, 1=round-robin, 2=least-QP, 3=time-hash
 uint32_t ocs_schedule_enable = 0;
 uint32_t rdma_transport_mode = 0;
 uint64_t rnic_gate_margin_ns = 200000;
@@ -681,8 +681,8 @@ bool ReadConf(string network_topo,string network_conf) {
         conf >> pfc_output_file;
       } else if (key.compare("SCALE_OUT_PLANE_SCHEDULER") == 0) {
         conf >> scale_out_plane_scheduler;
-        if (scale_out_plane_scheduler > 2) {
-          NS_ABORT_MSG("SCALE_OUT_PLANE_SCHEDULER must be 0(hash), 1(round-robin), or 2(least-QP)");
+        if (scale_out_plane_scheduler > 3) {
+          NS_ABORT_MSG("SCALE_OUT_PLANE_SCHEDULER must be 0(hash), 1(round-robin), 2(least-QP), or 3(time-hash)");
         }
       } else if (key.compare("OCS_SCHEDULE_ENABLE") == 0) {
         conf >> ocs_schedule_enable;
@@ -1455,6 +1455,15 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     }
   }
 
+#endif
+
+#if ENABLE_QP
+  if (scale_out_plane_scheduler == 3)
+    {
+      NS_ASSERT_MSG(ocs_num > 0 && ocs_schedule_enable,
+                    "TIME HASH requires OCS_SCHEDULE_ENABLE=1 and a compiled OCS schedule");
+      tdmController->InstallTimeHashReachability();
+    }
 #endif
 
   if (ocs_num > 0 && ocs_schedule_enable)
