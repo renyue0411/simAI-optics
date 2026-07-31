@@ -541,11 +541,49 @@ def parse_topology_file(path: Path) -> dict[str, Any]:
             link_count,
         ) = values
         gpu_type = header[7]
-        nvs_ids = [int(item) for item in lines[1].split()]
-        normal_eps_ids = [int(item) for item in lines[2].split()]
-        time_flow_eps_ids = [int(item) for item in lines[3].split()]
-        ocs_ids = [int(item) for item in lines[4].split()]
-        link_lines = lines[5:]
+
+        # Read ID sections according to their declared counts.
+        # A zero-count device class has no ID line because blank lines
+        # are removed above.
+        cursor = 1
+
+        def read_id_section(count: int, label: str) -> list[int]:
+            nonlocal cursor
+
+            if count == 0:
+                return []
+
+            if cursor >= len(lines):
+                raise ValueError(
+                    f"Missing {label} ID line in topology file: {path}"
+                )
+
+            tokens = lines[cursor].split()
+            cursor += 1
+
+            if len(tokens) != count:
+                raise ValueError(
+                    f"{label} count mismatch in {path}: "
+                    f"expected {count}, found {len(tokens)}"
+                )
+
+            try:
+                return [int(token) for token in tokens]
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid {label} ID line in {path}: "
+                    f"{' '.join(tokens)}"
+                ) from exc
+
+        nvs_ids = read_id_section(nvs_count, "NVSwitch")
+        normal_eps_ids = read_id_section(normal_eps_count, "normal EPS")
+        time_flow_eps_ids = read_id_section(
+            time_flow_eps_count,
+            "time-flow EPS",
+        )
+        ocs_ids = read_id_section(ocs_count, "OCS")
+
+        link_lines = lines[cursor:]
         topology_format = "time-flow-aware"
     else:
         if len(header) < 7:

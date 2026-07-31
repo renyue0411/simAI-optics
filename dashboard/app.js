@@ -921,13 +921,21 @@ function renderSelectedSchedule() {
   $('ocsScheduleBody').innerHTML = rows.join('');
 }
 
-function displayRnicPort(value) {
-  const port = Number(value);
-  if (!Number.isFinite(port)) return value ?? '—';
+function displayRnic(value) {
+  const encodedPort = Number(value);
 
-  // rnic_port is encoded as (NIC/group << 16) | local_port.
-  // For the current two-plane topology, 65536/65537 become 0/1.
-  return port >= 65536 ? port % 65536 : port;
+  if (!Number.isFinite(encodedPort) || encodedPort < 0) {
+    return '—';
+  }
+
+  // Encoded format:
+  // rnic_port = ((rnic_id + 1) << 16) | plane_id
+  // 65536 and 65537 therefore both belong to RNIC 0.
+  if (encodedPort >= 65536) {
+    return (encodedPort >>> 16) - 1;
+  }
+
+  return encodedPort;
 }
 
 function renderInjection() {
@@ -987,7 +995,7 @@ function renderSelectedInjectionNode() {
   if (exactRows.length) {
     const columns = [
       {key: 'node', label: 'node'},
-      {key: 'rnic_port', label: 'rnic_port', format: displayRnicPort},
+      {key: 'rnic_port', label: 'rnic', format: displayRnic},
       {key: 'plane', label: 'plane'},
       {key: 'start_ns', label: 'start_ns'},
       {key: 'end_ns', label: 'end_ns'},
@@ -1008,7 +1016,7 @@ function renderSelectedInjectionNode() {
 
   const columns = [
     {key: 'node', label: 'node'},
-    {key: 'rnic_port', label: 'rnic_port', format: displayRnicPort},
+    {key: 'rnic_port', label: 'rnic', format: displayRnic},
     {key: 'periodNs', label: 'period_ns'},
     {key: 'slots', label: 'slots'},
   ];
@@ -1113,7 +1121,7 @@ function renderRetransmission() {
 
   const columns = [
     'node',
-    'rnic_port',
+    'rnic',
     'plane',
     'Completed QPs',
     'Retrans Pkts',
@@ -1134,7 +1142,7 @@ function renderRetransmission() {
   $('retransBody').innerHTML = rows.map(row => `
     <tr>
       <td>${escapeHtml(row.node)}</td>
-      <td>${escapeHtml(Number(row.rnic_port) & 0xffff)}</td>
+      <td>${escapeHtml(displayRnic(row.rnic_port))}</td>
       <td>${row.plane === null ? '—' : escapeHtml(row.plane)}</td>
       <td>${fmt(row.completed_qps, 0)}</td>
       <td>${fmt(row.retrans_packets, 0)}</td>
