@@ -1112,8 +1112,9 @@ function renderRetransmission() {
   );
 
   const columns = [
-    'RNIC',
-    'Plane',
+    'node',
+    'rnic_port',
+    'plane',
     'Completed QPs',
     'Retrans Pkts',
     'Retrans Bytes',
@@ -1126,13 +1127,14 @@ function renderRetransmission() {
 
   if (!rows.length) {
     $('retransBody').innerHTML =
-      '<tr class="empty-row"><td colspan="7">No bound Scale-out RNIC telemetry was recorded.</td></tr>';
+      '<tr class="empty-row"><td colspan="8">No bound Scale-out RNIC telemetry was recorded.</td></tr>';
     return;
   }
 
   $('retransBody').innerHTML = rows.map(row => `
     <tr>
-      <td>Node ${escapeHtml(row.node)} / Port ${escapeHtml(row.rnic_port)}</td>
+      <td>${escapeHtml(row.node)}</td>
+      <td>${escapeHtml(Number(row.rnic_port) & 0xffff)}</td>
       <td>${row.plane === null ? '—' : escapeHtml(row.plane)}</td>
       <td>${fmt(row.completed_qps, 0)}</td>
       <td>${fmt(row.retrans_packets, 0)}</td>
