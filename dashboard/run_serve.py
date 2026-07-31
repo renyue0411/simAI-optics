@@ -32,6 +32,8 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterable
 
+# from openoptics.docs import conf
+
 DASHBOARD_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = DASHBOARD_DIR.parent
 DEFAULT_RUNS_DIR = PROJECT_ROOT / "experiments" / "runs"
@@ -351,6 +353,9 @@ def parse_log(path: Path) -> dict[str, Any]:
         "gate_mode": None,
         "multiplane": {},
         "time_hash": {},
+        "switch_time_flow": {},
+        "switch_time_flow_events": [],
+        "ocs_port_stats": [],
         "gate_tables": [],
         "wr_summaries": [],
         "ocs_stats": [],
@@ -383,6 +388,12 @@ def parse_log(path: Path) -> dict[str, Any]:
                 result["multiplane"] = parse_key_values(line)
             elif line.startswith("[TIME HASH SUMMARY]"):
                 result["time_hash"] = parse_key_values(line)
+            elif line.startswith("[SWITCH TIME FLOW INSTALLED]"):
+                values = parse_key_values(line)
+                result["switch_time_flow"] = values
+                result["switch_time_flow_events"].append(values)
+            elif line.startswith("[OCS PORT STATS]"):
+                result["ocs_port_stats"].append(parse_key_values(line))
             elif "GATE TABLE INSTALLED]" in line:
                 values = parse_key_values(line)
                 values["layer"] = "userspace" if "USERSPACE" in line else "rnic"
@@ -498,23 +509,73 @@ def parse_topology_file(path: Path) -> dict[str, Any]:
         return {}
 
     header = lines[0].split()
-    if len(header) < 6:
-        return {}
-    nums = [safe_int(item) for item in header[:6]]
-    if any(item is None for item in nums):
-        return {}
 
-    total_nodes, nvs_count, gpus_per_server, eps_count, ocs_count, link_count = nums
-    gpu_type = header[6] if len(header) > 6 else "Unknown"
-    non_ocs_ids = [int(item) for item in lines[1].split()]
-    ocs_ids = [int(item) for item in lines[2].split()]
-    nvs_ids = non_ocs_ids[:nvs_count]
-    eps_ids = non_ocs_ids[nvs_count : nvs_count + eps_count]
+    # Legacy format:
+    # total nvswitch gpus/server eps ocs links gpu_type
+    # <NVSwitch IDs + EPS IDs>
+    # <OCS IDs>
+    #
+    # Time-flow-aware format:
+    # total gpus/server nvswitch normal-eps time-flow-eps ocs links gpu_type
+    # <NVSwitch IDs>
+    # <normal EPS IDs>
+    # <time-flow EPS IDs>
+    # <OCS IDs>
+    is_time_flow_format = len(header) >= 8 and all(
+        safe_int(item) is not None for item in header[:7]
+    )
+
+    if is_time_flow_format:
+        if len(lines) < 5:
+            return {}
+        values = [safe_int(item) for item in header[:7]]
+        if any(item is None for item in values):
+            return {}
+        (
+            total_nodes,
+            gpus_per_server,
+            nvs_count,
+            normal_eps_count,
+            time_flow_eps_count,
+            ocs_count,
+            link_count,
+        ) = values
+        gpu_type = header[7]
+        nvs_ids = [int(item) for item in lines[1].split()]
+        normal_eps_ids = [int(item) for item in lines[2].split()]
+        time_flow_eps_ids = [int(item) for item in lines[3].split()]
+        ocs_ids = [int(item) for item in lines[4].split()]
+        link_lines = lines[5:]
+        topology_format = "time-flow-aware"
+    else:
+        if len(header) < 7:
+            return {}
+        values = [safe_int(item) for item in header[:6]]
+        if any(item is None for item in values):
+            return {}
+        total_nodes, nvs_count, gpus_per_server, eps_count, ocs_count, link_count = values
+        gpu_type = header[6]
+        non_ocs_ids = [int(item) for item in lines[1].split()]
+        ocs_ids = [int(item) for item in lines[2].split()]
+        nvs_ids = non_ocs_ids[:nvs_count]
+        normal_eps_ids = non_ocs_ids[nvs_count : nvs_count + eps_count]
+        time_flow_eps_ids = []
+        normal_eps_count = len(normal_eps_ids)
+        time_flow_eps_count = 0
+        link_lines = lines[3:]
+        topology_format = "legacy"
+
+    # Prefer actual ID-list lengths if a header and ID lines disagree.
+    nvs_count = len(nvs_ids)
+    normal_eps_count = len(normal_eps_ids)
+    time_flow_eps_count = len(time_flow_eps_ids)
+    ocs_count = len(ocs_ids)
+    eps_ids = normal_eps_ids + time_flow_eps_ids
     gpu_count = nvs_count * gpus_per_server
     gpu_ids = list(range(gpu_count))
 
     links: list[dict[str, Any]] = []
-    for raw in lines[3:]:
+    for raw in link_lines:
         parts = raw.split()
         if len(parts) < 6:
             continue
@@ -548,17 +609,27 @@ def parse_topology_file(path: Path) -> dict[str, Any]:
 
     return {
         "source": str(path),
+        "format": topology_format,
         "counts": {
             "total_nodes": total_nodes,
             "gpu": gpu_count,
             "server": nvs_count,
             "nvswitch": nvs_count,
-            "eps": eps_count,
+            "eps": normal_eps_count + time_flow_eps_count,
+            "normal_eps": normal_eps_count,
+            "time_flow_eps": time_flow_eps_count,
             "ocs": ocs_count,
-            "links": link_count,
+            "links": len(links) if links else link_count,
         },
         "gpu_type": gpu_type,
-        "ids": {"gpu": gpu_ids, "nvswitch": nvs_ids, "eps": eps_ids, "ocs": ocs_ids},
+        "ids": {
+            "gpu": gpu_ids,
+            "nvswitch": nvs_ids,
+            "eps": eps_ids,
+            "normal_eps": normal_eps_ids,
+            "time_flow_eps": time_flow_eps_ids,
+            "ocs": ocs_ids,
+        },
         "servers": servers,
         "links": links,
     }
@@ -620,11 +691,20 @@ def synthesize_topology(bindings: list[dict[str, Any]], schedule: dict[str, Any]
             "server": None,
             "nvswitch": None,
             "eps": len(eps_ids),
+            "normal_eps": len(eps_ids),
+            "time_flow_eps": 0,
             "ocs": len(ocs_ids),
             "links": len(links),
         },
         "gpu_type": "Unknown",
-        "ids": {"gpu": gpu_ids, "nvswitch": [], "eps": eps_ids, "ocs": ocs_ids},
+        "ids": {
+            "gpu": gpu_ids,
+            "nvswitch": [],
+            "eps": eps_ids,
+            "normal_eps": eps_ids,
+            "time_flow_eps": [],
+            "ocs": ocs_ids,
+        },
         "servers": [],
         "links": links,
         "partial": True,
@@ -636,6 +716,10 @@ def classify_topology(topology: dict[str, Any]) -> dict[str, Any]:
     gpu_set = set(ids.get("gpu", []))
     nvs_set = set(ids.get("nvswitch", []))
     eps_set = set(ids.get("eps", []))
+    normal_eps_set = set(ids.get("normal_eps", []))
+    time_flow_eps_set = set(ids.get("time_flow_eps", []))
+    if not normal_eps_set and not time_flow_eps_set:
+        normal_eps_set = eps_set
     ocs_set = set(ids.get("ocs", []))
     adjacency: dict[int, set[int]] = defaultdict(set)
     for link in topology.get("links", []):
@@ -651,12 +735,23 @@ def classify_topology(topology: dict[str, Any]) -> dict[str, Any]:
         for gpu in server.get("gpus", []):
             server_by_gpu[gpu] = server["id"]
 
+    label_prefix = {
+        "gpu": "GPU",
+        "nvswitch": "NVSWITCH",
+        "eps": "EPS",
+        "time_flow_eps": "TIME-FLOW EPS",
+        "leaf_ocs": "LEAF OCS",
+        "core_ocs": "CORE OCS",
+    }
+
     for node in sorted(gpu_set | nvs_set | eps_set | ocs_set):
         if node in gpu_set:
             node_type = "gpu"
         elif node in nvs_set:
             node_type = "nvswitch"
-        elif node in eps_set:
+        elif node in time_flow_eps_set:
+            node_type = "time_flow_eps"
+        elif node in normal_eps_set or node in eps_set:
             node_type = "eps"
         else:
             peers = adjacency.get(node, set())
@@ -664,7 +759,7 @@ def classify_topology(topology: dict[str, Any]) -> dict[str, Any]:
         nodes.append(
             {
                 "id": node,
-                "label": f"GPU {node}" if node_type == "gpu" else f"{node_type.replace('_', ' ').upper()} {node}",
+                "label": f"{label_prefix[node_type]} {node}",
                 "type": node_type,
                 "server": server_by_gpu.get(node),
                 "degree": len(adjacency.get(node, set())),
@@ -814,24 +909,46 @@ def aggregate_wr_summaries(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def config_card_data(conf: dict[str, str], topology: dict[str, Any], manifest: dict[str, Any], log: dict[str, Any]) -> list[dict[str, Any]]:
     counts = topology.get("counts", {})
     rdma_mode = safe_int(conf.get("RDMA_TRANSPORT_MODE"), 0)
+    cc_mode = safe_int(conf.get("CC_MODE"), None)
     scheduler = safe_int(conf.get("SCALE_OUT_PLANE_SCHEDULER"), 0)
+    switch_time_flow_mode = safe_int(conf.get("SWITCH_TIME_FLOW_MODE"), 0)
     rdma_labels = {0: "Default RDMA", 1: "RNIC", 2: "User-space"}
+    cc_labels = {0: "Disabled", 1: "DCQCN", 3: "HPCC", 7: "TIMELY", 8: "DCTCP", 10: "HPCC-PINT", 11: "HPCC-PINT-DCQCN"}
     scheduler_labels = {0: "Hash", 1: "Round Robin", 2: "Least-QP", 3: "Time Hash"}
-    cards = [
+    switch_time_flow_labels = {
+        0: "Disabled",
+        1: "Gate",
+        2: "Route-gate",
+    }
+    install = log.get("switch_time_flow", {})
+    install_value = "—"
+    if install:
+        install_value = (
+            f"{install.get('capable_eps', '—')} EPS"
+            # f"{install.get('calendar_ports', '—')} ports · "
+            # f"{install.get('entries', '—')} entries"
+        )
+
+    return [
         {"label": "GPU", "value": counts.get("gpu")},
         {"label": "Server", "value": counts.get("server")},
         {"label": "NVSwitch", "value": counts.get("nvswitch")},
-        {"label": "EPS", "value": counts.get("eps")},
+        {"label": "Normal EPS", "value": counts.get("normal_eps", counts.get("eps"))},
+        {"label": "Time-flow EPS", "value": counts.get("time_flow_eps", 0)},
         {"label": "OCS", "value": counts.get("ocs")},
         {"label": "GPU Type", "value": topology.get("gpu_type")},
         {"label": "RDMA Mode", "value": f"{rdma_mode} · {rdma_labels.get(rdma_mode, 'Unknown')}"},
-        {"label": "CC Mode", "value": conf.get("CC_MODE", "—")},
+        {"label": "CC Mode", "value": f"{cc_mode} · {cc_labels.get(cc_mode, 'Unknown')}"},
         {"label": "Plane Scheduler", "value": f"{scheduler} · {scheduler_labels.get(scheduler, 'Unknown')}"},
+        {
+            "label": "Switch Time-flow",
+            "value": f"{switch_time_flow_mode} · {switch_time_flow_labels.get(switch_time_flow_mode, 'Unknown')}",
+        },
+        {"label": "Time-flow Install", "value": install_value},
         {"label": "ACK Policy", "value": log.get("multiplane", {}).get("ack_policy", "—")},
         {"label": "OCS Schedule", "value": "Enabled" if safe_int(conf.get("OCS_SCHEDULE_ENABLE"), 0) else "Disabled"},
         {"label": "Threads", "value": manifest.get("threads", "—")},
     ]
-    return cards
 
 
 def parse_experiment(run_dir: Path, experiments_root: Path) -> dict[str, Any]:
@@ -909,6 +1026,10 @@ def parse_experiment(run_dir: Path, experiments_root: Path) -> dict[str, Any]:
             "OCS statistics were enabled, but no [OCS STATS] entries were found in simulator.log."
         )
 
+    switch_time_flow_mode = safe_int(conf.get("SWITCH_TIME_FLOW_MODE"), 0) or 0
+    if switch_time_flow_mode > 0 and not log.get("switch_time_flow"):
+        warnings.append("Switch Time-flow enabled, but install telemetry is missing.")
+
     if not log.get("retransmission"):
         warnings.append(
             "No RNIC retransmission telemetry was found. "
@@ -941,6 +1062,9 @@ def parse_experiment(run_dir: Path, experiments_root: Path) -> dict[str, Any]:
         "schedule": schedule,
         "injection": injection,
         "ocs_stats": log.get("ocs_stats", []),
+        "ocs_port_stats": log.get("ocs_port_stats", []),
+        "switch_time_flow": log.get("switch_time_flow", {}),
+        "switch_time_flow_events": log.get("switch_time_flow_events", []),
         "retransmission": log.get("retransmission", []),
         "log_tags": log.get("tags", {}),
         "warnings": warnings,

@@ -10,6 +10,7 @@ const state = {
   sportFilter: 'all',
   flowLimit: '24',
   isolatedFlow: null,
+  injectionNode: null,
   flowSort: { key: 'fct_us', direction: 'desc' },
   topology: { scale: 1, tx: 0, ty: 0, draggingNode: null, panning: false, lastX: 0, lastY: 0, positions: {} },
 };
@@ -81,6 +82,7 @@ async function selectExperiment(name) {
   if (!name) return;
   state.selectedName = name;
   state.isolatedFlow = null;
+  state.injectionNode = null;
   state.topology = { scale: 1, tx: 0, ty: 0, draggingNode: null, panning: false, lastX: 0, lastY: 0, positions: {} };
   renderExperimentList();
   setLoading(true);
@@ -919,6 +921,15 @@ function renderSelectedSchedule() {
   $('ocsScheduleBody').innerHTML = rows.join('');
 }
 
+function displayRnicPort(value) {
+  const port = Number(value);
+  if (!Number.isFinite(port)) return value ?? '—';
+
+  // rnic_port is encoded as (NIC/group << 16) | local_port.
+  // For the current two-plane topology, 65536/65537 become 0/1.
+  return port >= 65536 ? port % 65536 : port;
+}
+
 function renderInjection() {
   const injection = state.data.injection || {};
   const mode = Number(injection.mode || 0);
@@ -926,27 +937,91 @@ function renderInjection() {
   const wr = injection.wr?.totals || {};
   const stats = [
     ['Mode', `${mode} · ${modeLabel}`],
-    ['Endpoint tables', injection.gate_tables?.length || 0],
   ];
-  if (mode === 2) {
-    stats.push(['WR flows', wr.flows || 0], ['WR posts', wr.posts || 0], ['Posted bytes', wr.bytes_human || '—']);
-  }
-  $('injectionSummary').innerHTML = stats.map(([label, value]) => `<span class="inline-stat">${label}: <strong>${escapeHtml(value)}</strong></span>`).join('');
-  // $('injectionExactNotice').textContent = injection.exact
-  //   ? `Exact window source: ${injection.source}`
-  //   : 'Exact start/end windows were not exported for this run. The table below shows installed gate-table summaries.';
 
-  if (injection.exact && injection.rows?.length) {
-    const keys = Object.keys(injection.rows[0]);
-    $('injectionHead').innerHTML = `<tr>${keys.map(key => `<th>${escapeHtml(key)}</th>`).join('')}</tr>`;
-    $('injectionBody').innerHTML = injection.rows.map(row => `<tr>${keys.map(key => `<td>${escapeHtml(row[key])}</td>`).join('')}</tr>`).join('');
+  if (mode === 2) {
+    stats.push(
+      ['WR flows', wr.flows || 0],
+      ['WR posts', wr.posts || 0],
+      ['Posted bytes', wr.bytes_human || '—'],
+    );
+  }
+
+  $('injectionSummary').innerHTML = stats
+    .map(([label, value]) => `<span class="inline-stat">${label}: <strong>${escapeHtml(value)}</strong></span>`)
+    .join('');
+
+  const sourceRows = injection.exact && injection.rows?.length
+    ? injection.rows
+    : (injection.gate_tables || []);
+
+  const nodes = [...new Set(sourceRows
+    .map(row => Number(row.node))
+    .filter(Number.isFinite))]
+    .sort((a, b) => a - b);
+
+  const selector = $('injectionNodeSelector');
+  selector.innerHTML = nodes
+    .map(node => `<option value="${node}">Node ${node}</option>`)
+    .join('');
+  selector.disabled = nodes.length === 0;
+
+  if (!nodes.includes(Number(state.injectionNode))) {
+    state.injectionNode = nodes[0] ?? null;
+  }
+
+  if (state.injectionNode !== null) {
+    selector.value = String(state.injectionNode);
+  }
+
+  renderSelectedInjectionNode();
+}
+
+function renderSelectedInjectionNode() {
+  const injection = state.data.injection || {};
+  const selectedNode = Number(state.injectionNode);
+  const exactRows = injection.exact && injection.rows?.length
+    ? injection.rows
+    : [];
+
+  if (exactRows.length) {
+    const columns = [
+      {key: 'node', label: 'node'},
+      {key: 'rnic_port', label: 'rnic_port', format: displayRnicPort},
+      {key: 'plane', label: 'plane'},
+      {key: 'start_ns', label: 'start_ns'},
+      {key: 'end_ns', label: 'end_ns'},
+      {key: 'period_ns', label: 'period_ns'},
+      {key: 'destinations', label: 'destinations'},
+    ];
+
+    const rows = exactRows.filter(row => Number(row.node) === selectedNode);
+    $('injectionHead').innerHTML = `<tr>${columns.map(column => `<th>${escapeHtml(column.label)}</th>`).join('')}</tr>`;
+    $('injectionBody').innerHTML = rows.map(row => `
+      <tr>${columns.map(column => {
+        const value = column.format ? column.format(row[column.key]) : (row[column.key] ?? '—');
+        return `<td>${escapeHtml(value)}</td>`;
+      }).join('')}</tr>
+    `).join('') || `<tr class="empty-row"><td colspan="${columns.length}">No Injection Windows for Node ${escapeHtml(selectedNode)}.</td></tr>`;
     return;
   }
-  const columns = mode === 2
-    ? ['node', 'rnic_port', 'periodNs', 'slots', 'layer']
-    : ['node', 'rnic_port', 'periodNs', 'slots', 'layer'];
-  $('injectionHead').innerHTML = `<tr>${columns.map(key => `<th>${escapeHtml(key)}</th>`).join('')}</tr>`;
-  $('injectionBody').innerHTML = (injection.gate_tables || []).map(row => `<tr>${columns.map(key => `<td>${escapeHtml(row[key] ?? '—')}</td>`).join('')}</tr>`).join('') || `<tr class="empty-row"><td colspan="${columns.length}">No gate-table telemetry was found.</td></tr>`;
+
+  const columns = [
+    {key: 'node', label: 'node'},
+    {key: 'rnic_port', label: 'rnic_port', format: displayRnicPort},
+    {key: 'periodNs', label: 'period_ns'},
+    {key: 'slots', label: 'slots'},
+  ];
+  const rows = (injection.gate_tables || [])
+    .filter(row => Number(row.node) === selectedNode);
+
+  $('injectionHead').innerHTML = `<tr>${columns.map(column => `<th>${escapeHtml(column.label)}</th>`).join('')}</tr>`;
+  $('injectionBody').innerHTML = rows.map(row => `
+    <tr>${columns.map(column => {
+      const value = column.format ? column.format(row[column.key]) : (row[column.key] ?? '—');
+      return `<td>${escapeHtml(value)}</td>`;
+    }).join('')}</tr>
+  `).join('') || `<tr class="empty-row"><td colspan="${columns.length}">No gate-table telemetry for Node ${escapeHtml(selectedNode)}.</td></tr>`;
 }
 
 function renderOcsStats() {
@@ -1087,6 +1162,10 @@ function bindEvents() {
     renderFlowTable();
   }));
   $('ocsSelector').addEventListener('change', renderSelectedSchedule);
+  $('injectionNodeSelector').addEventListener('change', event => {
+    state.injectionNode = Number(event.target.value);
+    renderSelectedInjectionNode();
+  });
 }
 
 bindEvents();

@@ -17,7 +17,7 @@
         </div>
       </div>
       <div class="sidebar-toolbar">
-        <input id="experimentSearch" type="search" placeholder="Search experiments" />
+        <input id="experimentSearch" type="search" placeholder="Search" />
         <button id="refreshExperiments" class="icon-button" title="Refresh">↻</button>
       </div>
       <div id="runsPath" class="runs-path"></div>
@@ -134,11 +134,12 @@
         </article>
 
         <article class="section-block compact-block">
-          <div class="section-heading">
+          <div class="section-heading with-actions">
             <div>
               <p class="eyebrow">Transport Control</p>
               <h3>Injection Window Table</h3>
             </div>
+            <select id="injectionNodeSelector" aria-label="Select endpoint node"></select>
           </div>
           <div id="injectionSummary" class="inline-stats"></div>
           <div id="injectionExactNotice" class="subtle notice"></div>
