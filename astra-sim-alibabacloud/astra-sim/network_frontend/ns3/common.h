@@ -93,6 +93,9 @@ uint32_t enable_trace = 1;
 uint32_t buffer_size = 16;
 
 uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server;
+uint32_t normal_switch_num = 0;
+uint32_t timeflow_switch_num = 0;
+uint32_t switch_time_flow_mode = 0;
 uint32_t ocs_num = 0;
 uint32_t scale_out_plane_scheduler = 0; // 0=hash, 1=round-robin, 2=least-QP, 3=time-hash
 uint32_t ocs_schedule_enable = 0;
@@ -690,6 +693,12 @@ bool ReadConf(string network_topo,string network_conf) {
         conf >> ocs_map_file;
       } else if (key.compare("OCS_SCHEDULE_FILE") == 0) {
         conf >> ocs_schedule_file;
+      } else if (key.compare("SWITCH_TIME_FLOW_MODE") == 0) {
+        conf >> switch_time_flow_mode;
+        if (switch_time_flow_mode > 2) {
+          NS_ABORT_MSG("SWITCH_TIME_FLOW_MODE must be 0(disabled), "
+                       "1(forward-then-gate), or 2(route-and-gate)");
+        }
       } else if (key.compare("OCS_STATS_ENABLE") == 0) {
   conf >> ocs_stats_enable;
   } else if (key.compare("OCS_STATS_INTERVAL_US") == 0) {
@@ -890,7 +899,9 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     node_num = std::stoul(topo_header_fields[0]);
     gpus_per_server = std::stoul(topo_header_fields[1]);
     nvswitch_num = std::stoul(topo_header_fields[2]);
-    switch_num = std::stoul(topo_header_fields[3]);
+    normal_switch_num = std::stoul(topo_header_fields[3]);
+    timeflow_switch_num = 0;
+    switch_num = normal_switch_num;
     ocs_num = 0;
     link_num = std::stoul(topo_header_fields[4]);
     gpu_type_str = topo_header_fields[5];
@@ -898,13 +909,30 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     node_num = std::stoul(topo_header_fields[0]);
     gpus_per_server = std::stoul(topo_header_fields[1]);
     nvswitch_num = std::stoul(topo_header_fields[2]);
-    switch_num = std::stoul(topo_header_fields[3]);
+    normal_switch_num = std::stoul(topo_header_fields[3]);
+    timeflow_switch_num = 0;
+    switch_num = normal_switch_num;
     ocs_num = std::stoul(topo_header_fields[4]);
     link_num = std::stoul(topo_header_fields[5]);
     gpu_type_str = topo_header_fields[6];
+  } else if (topo_header_fields.size() == 8) {
+    node_num = std::stoul(topo_header_fields[0]);
+    gpus_per_server = std::stoul(topo_header_fields[1]);
+    nvswitch_num = std::stoul(topo_header_fields[2]);
+    normal_switch_num = std::stoul(topo_header_fields[3]);
+    timeflow_switch_num = std::stoul(topo_header_fields[4]);
+    switch_num = normal_switch_num + timeflow_switch_num;
+    ocs_num = std::stoul(topo_header_fields[5]);
+    link_num = std::stoul(topo_header_fields[6]);
+    gpu_type_str = topo_header_fields[7];
   } else {
-    NS_ABORT_MSG("Invalid topology header. Expected 6 legacy fields or 7 SimAI+OCS fields, got "
+    NS_ABORT_MSG("Invalid topology header. Expected 6 legacy fields, "
+                 "7 SimAI+OCS fields, or 8 fields with normal/time-flow EPS counts; got "
                  << topo_header_fields.size() << ": " << topo_header_line);
+  }
+
+  if (nvswitch_num + switch_num + ocs_num > node_num) {
+    NS_ABORT_MSG("Topology declares more NVSwitch/EPS/OCS nodes than node_num");
   }
   std::ostringstream topo_remaining_buf;
   std::string topo_data_line;
@@ -929,32 +957,65 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
   }
 
   std::vector<uint32_t> node_type(node_num, 0);
+  std::vector<bool> node_role_assigned(node_num, false);
+  std::vector<bool> timeflow_capable(node_num, false);
+  std::vector<uint32_t> timeflow_switch_ids;
+
   for (uint32_t i = 0; i < nvswitch_num; i++) {
     uint32_t sid;
     topo_data >> sid;
+    if (!topo_data || sid >= node_num) {
+      NS_ABORT_MSG("Invalid NVSwitch node id in topology");
+    }
+    if (node_role_assigned[sid]) {
+      NS_ABORT_MSG("Duplicate topology node role for node " << sid);
+    }
+    node_role_assigned[sid] = true;
     node_type[sid] = 2;
-	}
-	for (uint32_t i = 0; i < switch_num; i++)
-	{
-		uint32_t sid;
-		topo_data >> sid;
-		node_type[sid] = 1;
-	}
-	std::vector<uint32_t> ocs_node_ids;
+  }
 
-	for (uint32_t i = 0; i < ocs_num; i++)
+  for (uint32_t i = 0; i < normal_switch_num; i++) {
+    uint32_t sid;
+    topo_data >> sid;
+    if (!topo_data || sid >= node_num) {
+      NS_ABORT_MSG("Invalid normal EPS node id in topology");
+    }
+    if (node_role_assigned[sid]) {
+      NS_ABORT_MSG("Duplicate topology node role for node " << sid);
+    }
+    node_role_assigned[sid] = true;
+    node_type[sid] = 1;
+  }
 
-	{
+  for (uint32_t i = 0; i < timeflow_switch_num; i++) {
+    uint32_t sid;
+    topo_data >> sid;
+    if (!topo_data || sid >= node_num) {
+      NS_ABORT_MSG("Invalid time-flow EPS node id in topology");
+    }
+    if (node_role_assigned[sid]) {
+      NS_ABORT_MSG("Duplicate topology node role for node " << sid);
+    }
+    node_role_assigned[sid] = true;
+    node_type[sid] = 1;
+    timeflow_capable[sid] = true;
+    timeflow_switch_ids.push_back(sid);
+  }
 
-		uint32_t sid;
-
-		topo_data >> sid;
-
-		node_type[sid] = 3;
-
-		ocs_node_ids.push_back(sid);
-
-	}
+  std::vector<uint32_t> ocs_node_ids;
+  for (uint32_t i = 0; i < ocs_num; i++) {
+    uint32_t sid;
+    topo_data >> sid;
+    if (!topo_data || sid >= node_num) {
+      NS_ABORT_MSG("Invalid OCS node id in topology");
+    }
+    if (node_role_assigned[sid]) {
+      NS_ABORT_MSG("Duplicate topology node role for node " << sid);
+    }
+    node_role_assigned[sid] = true;
+    node_type[sid] = 3;
+    ocs_node_ids.push_back(sid);
+  }
 
 	for (uint32_t i = 0; i < node_num; i++){
 
@@ -964,6 +1025,8 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 			Ptr<SwitchNode> sw = CreateObject<SwitchNode>();
 			n.Add(sw);
 			sw->SetAttribute("EcnEnabled", BooleanValue(enable_qcn));
+      sw->SetTimeFlowCapable(timeflow_capable[i]);
+      sw->SetTimeFlowMode(timeflow_capable[i] ? switch_time_flow_mode : 0);
 		}else if(node_type[i] == 2){
 			Ptr<NVSwitchNode> sw = CreateObject<NVSwitchNode>();
 			n.Add(sw);
@@ -979,6 +1042,9 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
   tdmController->SetRnicGateBurstBytes(rnic_gate_burst_bytes);
   for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
     tdmController->AddOcsNode(ocs_node_ids[i]);
+  }
+  for (uint32_t i = 0; i < timeflow_switch_ids.size(); i++) {
+    tdmController->AddTimeFlowSwitch(timeflow_switch_ids[i]);
   }
   if (ocs_num > 0) {
     NS_LOG_UNCOND("[OCS TOPOLOGY] ocs_count=" << ocs_num);
@@ -1483,6 +1549,10 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 
   CalculateRoutes(n);
   SetRoutingEntries();
+
+  // Mode 1 uses the output interface selected by the existing forwarding table,
+  // so switch time-flow entries are compiled only after routing is installed.
+  tdmController->InstallSwitchTimeFlowTables(switch_time_flow_mode);
 
   maxRtt = maxBdp = 0;
   for (uint32_t i = 0; i < node_num; i++) {
