@@ -106,6 +106,9 @@ uint64_t rnic_deadline_clock_guard_ns = 0;
 uint64_t rnic_deadline_initial_guard_ns = 0;
 uint32_t rnic_deadline_min_rtt_samples = 4;
 uint32_t rnic_deadline_rttvar_multiplier = 4;
+// MODE1_CONTINUATION_ACK_RECOVERY_V1: one optional enable switch; packet
+// size and retry bound are derived inside the RNIC model.
+uint32_t rnic_ack_recovery_enable = 1;
 uint32_t ocs_stats_enable = 0;
 uint64_t ocs_stats_interval_us = 10000;
 uint64_t ocs_stats_start_us = 0;
@@ -734,6 +737,9 @@ bool ReadConf(string network_topo,string network_conf) {
 
   } else if (key.compare("RNIC_DEADLINE_RTTVAR_MULTIPLIER") == 0) {
   conf >> rnic_deadline_rttvar_multiplier;
+
+  } else if (key.compare("RNIC_ACK_RECOVERY_ENABLE") == 0) {
+  conf >> rnic_ack_recovery_enable;
 
   } else if (key.compare("LINK_DOWN") == 0) {
         conf >> link_down_time >> link_down_A >> link_down_B;
@@ -1541,6 +1547,8 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
           rnic_deadline_initial_guard_ns,
           rnic_deadline_min_rtt_samples,
           rnic_deadline_rttvar_multiplier);
+      rdmaHw->ConfigureRnicAckRecovery(
+          rdma_transport_mode == 1 && rnic_ack_recovery_enable != 0);
       Ptr<RdmaDriver> rdma = CreateObject<RdmaDriver>();
       Ptr<Node> node = n.Get(i);
       rdma->SetNode(node);
