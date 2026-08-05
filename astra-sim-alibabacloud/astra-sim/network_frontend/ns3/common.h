@@ -100,8 +100,12 @@ uint32_t ocs_num = 0;
 uint32_t scale_out_plane_scheduler = 0; // 0=hash, 1=round-robin, 2=least-QP, 3=time-hash
 uint32_t ocs_schedule_enable = 0;
 uint32_t rdma_transport_mode = 0;
-uint64_t rnic_gate_margin_ns = 200000;
-uint64_t rnic_gate_burst_bytes = 65536;
+uint32_t rnic_deadline_enable = 1;
+uint64_t rnic_deadline_pipeline_guard_ns = 0;
+uint64_t rnic_deadline_clock_guard_ns = 0;
+uint64_t rnic_deadline_initial_guard_ns = 0;
+uint32_t rnic_deadline_min_rtt_samples = 4;
+uint32_t rnic_deadline_rttvar_multiplier = 4;
 uint32_t ocs_stats_enable = 0;
 uint64_t ocs_stats_interval_us = 10000;
 uint64_t ocs_stats_start_us = 0;
@@ -713,11 +717,23 @@ bool ReadConf(string network_topo,string network_conf) {
     NS_ABORT_MSG("RDMA transport mode must be 0(default), 1(RNIC), or 2(userspace)");
   }
 
-  } else if (key.compare("RNIC_GATE_MARGIN_NS") == 0) {
-  conf >> rnic_gate_margin_ns;
+  } else if (key.compare("RNIC_DEADLINE_ENABLE") == 0) {
+  conf >> rnic_deadline_enable;
 
-  } else if (key.compare("RNIC_GATE_BURST_BYTES") == 0) {
-  conf >> rnic_gate_burst_bytes;
+  } else if (key.compare("RNIC_DEADLINE_PIPELINE_GUARD_NS") == 0) {
+  conf >> rnic_deadline_pipeline_guard_ns;
+
+  } else if (key.compare("RNIC_DEADLINE_CLOCK_GUARD_NS") == 0) {
+  conf >> rnic_deadline_clock_guard_ns;
+
+  } else if (key.compare("RNIC_DEADLINE_INITIAL_GUARD_NS") == 0) {
+  conf >> rnic_deadline_initial_guard_ns;
+
+  } else if (key.compare("RNIC_DEADLINE_MIN_RTT_SAMPLES") == 0) {
+  conf >> rnic_deadline_min_rtt_samples;
+
+  } else if (key.compare("RNIC_DEADLINE_RTTVAR_MULTIPLIER") == 0) {
+  conf >> rnic_deadline_rttvar_multiplier;
 
   } else if (key.compare("LINK_DOWN") == 0) {
         conf >> link_down_time >> link_down_A >> link_down_B;
@@ -873,6 +889,19 @@ DumpOcsStatsPeriodic()
       Simulator::Schedule(MicroSeconds(ocs_stats_interval_us),
                           &DumpOcsStatsPeriodic);
     }
+}
+
+static void
+DumpOcsStatsFinal()
+{
+  if (ocs_num == 0 || !ocs_stats_enable)
+    {
+      return;
+    }
+
+  NS_LOG_UNCOND("[OCS STATS FINAL]"
+                << " t_ns=" << Simulator::Now().GetNanoSeconds());
+  DumpOcsStatsOnce();
 }
 
 void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_finish)(FILE *, Ptr<RdmaQueuePair>)) {
@@ -1038,8 +1067,6 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 
   Ptr<TdmController> tdmController = CreateObject<TdmController>();
   tdmController->SetNodeContainer(n);
-  tdmController->SetRnicGateExtraMarginNs(rnic_gate_margin_ns);
-  tdmController->SetRnicGateBurstBytes(rnic_gate_burst_bytes);
   for (uint32_t i = 0; i < ocs_node_ids.size(); i++) {
     tdmController->AddOcsNode(ocs_node_ids[i]);
   }
@@ -1373,10 +1400,17 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
   if (ocs_num > 0 && ocs_stats_enable)
     {
       NS_LOG_UNCOND("[OCS STATS ENABLED]"
+                    << " mode="
+                    << (ocs_stats_interval_us > 0
+                            ? "periodic+final"
+                            : "final_only")
                     << " start_us=" << ocs_stats_start_us
                     << " interval_us=" << ocs_stats_interval_us);
-      Simulator::Schedule(MicroSeconds(ocs_stats_start_us),
-                          &DumpOcsStatsPeriodic);
+      if (ocs_stats_interval_us > 0)
+        {
+          Simulator::Schedule(MicroSeconds(ocs_stats_start_us),
+                              &DumpOcsStatsPeriodic);
+        }
     }
   if (ocs_num > 0 && ocs_schedule_enable)
     {
@@ -1500,6 +1534,13 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
       rdmaHw->SetPintSmplThresh(pint_prob);
       rdmaHw->SetAttribute("TotalPauseTimes",
                            UintegerValue(nic_total_pause_time));
+      rdmaHw->ConfigureRnicDeadline(
+          rdma_transport_mode == 1 && rnic_deadline_enable != 0,
+          rnic_deadline_pipeline_guard_ns,
+          rnic_deadline_clock_guard_ns,
+          rnic_deadline_initial_guard_ns,
+          rnic_deadline_min_rtt_samples,
+          rnic_deadline_rttvar_multiplier);
       Ptr<RdmaDriver> rdma = CreateObject<RdmaDriver>();
       Ptr<Node> node = n.Get(i);
       rdma->SetNode(node);
