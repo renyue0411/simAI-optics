@@ -826,22 +826,49 @@ function renderThroughputChart() {
 
     if (useActual) {
       const series = actualSeries.get(flow.id);
-      const samples = series?.samples || [];
+      const samples = [...(series?.samples || [])].sort((a, b) => a.start_us - b.start_us);
       if (!samples.length) return '';
-      const commands = [`M ${sx(samples[0].start_us)} ${baseline}`];
-      let previousEnd = samples[0].start_us;
+
+      // A per-flow throughput timeline is rendered as rectangular active intervals:
+      // rise at interval start, remain flat at the interval-average throughput,
+      // then fall at interval end. Consecutive buckets belong to one rectangle;
+      // a real time gap starts a new rectangle.
+      const intervals = [];
+      let current = null;
+      const epsilonUs = 1e-6;
+
       samples.forEach(sample => {
-        if (sample.start_us > previousEnd) {
-          commands.push(`L ${sx(previousEnd)} ${baseline}`);
-          commands.push(`L ${sx(sample.start_us)} ${baseline}`);
+        const startUs = Number(sample.start_us);
+        const endUs = Number(sample.end_us);
+        const bytes = Number(sample.bytes || 0);
+        if (!Number.isFinite(startUs) || !Number.isFinite(endUs) || endUs <= startUs) return;
+
+        if (!current || startUs > current.end_us + epsilonUs) {
+          if (current) intervals.push(current);
+          current = {
+            start_us: startUs,
+            end_us: endUs,
+            bytes,
+          };
+        } else {
+          current.end_us = Math.max(current.end_us, endUs);
+          current.bytes += bytes;
         }
-        commands.push(`L ${sx(sample.start_us)} ${sy(sample.gbps)}`);
-        commands.push(`L ${sx(sample.end_us)} ${sy(sample.gbps)}`);
-        commands.push(`L ${sx(sample.end_us)} ${baseline}`);
-        previousEnd = sample.end_us;
       });
-      const title = `${flow.id} · max ${fmt(series.max_gbps, 3)} Gbps · active avg ${fmt(series.active_avg_gbps, 3)} Gbps`;
-      return `<path class="flow-path ${classes}" data-flow-id="${escapeHtml(flow.id)}" d="${commands.join(' ')}" stroke="${color}"><title>${escapeHtml(title)}</title></path>`;
+      if (current) intervals.push(current);
+
+      const intervalMarkup = intervals.map(interval => {
+        const durationNs = (interval.end_us - interval.start_us) * 1000.0;
+        const gbps = durationNs > 0 ? interval.bytes * 8.0 / durationNs : 0;
+        const x1 = sx(interval.start_us);
+        const x2 = sx(interval.end_us);
+        const y = sy(gbps);
+        const d = `M ${x1} ${baseline} L ${x1} ${y} L ${x2} ${y} L ${x2} ${baseline}`;
+        const title = `${flow.id} · ${fmt(gbps, 3)} Gbps · ${fmt(interval.start_us / 1000, 3)}–${fmt(interval.end_us / 1000, 3)} ms`;
+        return `<path class="flow-path throughput-rect ${classes}" data-flow-id="${escapeHtml(flow.id)}" d="${d}" stroke="${color}" style="fill:${color};fill-opacity:.10"><title>${escapeHtml(title)}</title></path>`;
+      }).join('');
+
+      return intervalMarkup;
     }
 
     const x1 = sx(flow.start_us), x2 = sx(flow.end_us), y = sy(flow.avg_gbps);
