@@ -109,6 +109,18 @@ uint32_t rnic_deadline_rttvar_multiplier = 4;
 // MODE1_CONTINUATION_ACK_RECOVERY_V1: one optional enable switch; packet
 // size and retry bound are derived inside the RNIC model.
 uint32_t rnic_ack_recovery_enable = 1;
+uint64_t rnic_ack_flush_guard_ns = 10000;
+// Mode-2 commodity RNIC RC reliability. These map conceptually to an RC QP
+// local ACK timeout and retry count; the first simulator interface uses ns.
+uint32_t rc_ack_retry_enable = 1;
+uint64_t rc_ack_timeout_ns = 100000;
+uint32_t rc_retry_count = 7;
+// Mode-2 userspace bootstrap timing estimate.  This is deliberately not
+// populated from simulator pairRtt/QP internals; future rdma-core deployments
+// can supply the same value from configuration/calibration.
+uint64_t userspace_initial_rtt_ns = 20000;
+// Zero preserves the transport profile default (10 us simulator / 50 us real mode).
+uint64_t userspace_min_tail_guard_ns = 0;
 uint32_t ocs_stats_enable = 0;
 uint64_t ocs_stats_interval_us = 10000;
 uint64_t ocs_stats_start_us = 0;
@@ -740,6 +752,27 @@ bool ReadConf(string network_topo,string network_conf) {
 
   } else if (key.compare("RNIC_ACK_RECOVERY_ENABLE") == 0) {
   conf >> rnic_ack_recovery_enable;
+
+  } else if (key.compare("RNIC_ACK_FLUSH_GUARD_NS") == 0) {
+  conf >> rnic_ack_flush_guard_ns;
+
+  } else if (key.compare("RC_ACK_RETRY_ENABLE") == 0) {
+  conf >> rc_ack_retry_enable;
+
+  } else if (key.compare("RC_ACK_TIMEOUT_NS") == 0) {
+  conf >> rc_ack_timeout_ns;
+
+  } else if (key.compare("RC_RETRY_COUNT") == 0) {
+  conf >> rc_retry_count;
+
+  } else if (key.compare("USERSPACE_INITIAL_RTT_NS") == 0) {
+  conf >> userspace_initial_rtt_ns;
+  if (userspace_initial_rtt_ns == 0) {
+    NS_ABORT_MSG("USERSPACE_INITIAL_RTT_NS must be positive");
+  }
+
+  } else if (key.compare("USERSPACE_MIN_TAIL_GUARD_NS") == 0) {
+  conf >> userspace_min_tail_guard_ns;
 
   } else if (key.compare("LINK_DOWN") == 0) {
         conf >> link_down_time >> link_down_A >> link_down_B;
@@ -1549,6 +1582,10 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
           rnic_deadline_rttvar_multiplier);
       rdmaHw->ConfigureRnicAckRecovery(
           rdma_transport_mode == 1 && rnic_ack_recovery_enable != 0);
+      rdmaHw->ConfigureRcAckRetry(
+          rdma_transport_mode == 2 && rc_ack_retry_enable != 0,
+          rc_ack_timeout_ns,
+          rc_retry_count);
       Ptr<RdmaDriver> rdma = CreateObject<RdmaDriver>();
       Ptr<Node> node = n.Get(i);
       rdma->SetNode(node);
@@ -1563,6 +1600,15 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
                                       binding.ifIndex);
       }
       rdma->SetInjectionMode(rdma_transport_mode);
+      if (rdma_transport_mode == 2) {
+        rdma->GetTransport()->ConfigureUserspaceInitialRtt(
+            userspace_initial_rtt_ns);
+        rdma->GetTransport()->ConfigureUserspaceMinTailGuard(
+            userspace_min_tail_guard_ns);
+      }
+      rdma->GetTransport()->ConfigureRnicAckFlush(
+          rdma_transport_mode == 1 && rnic_ack_recovery_enable != 0,
+          rnic_ack_flush_guard_ns);
       rdma->ConfigureTransport(32 * 1024, 256 * 1024);
       rdma->TraceConnectWithoutContext(
           "QpComplete", MakeBoundCallback(qp_finish, fct_output));
