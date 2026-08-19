@@ -36,7 +36,7 @@ from typing import Any, Iterable
 
 DASHBOARD_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = DASHBOARD_DIR.parent
-DEFAULT_RUNS_DIR = PROJECT_ROOT / "experiments" / "runs"
+DEFAULT_RUNS_DIR = PROJECT_ROOT / "experiments" / "runs_dashboard"
 
 KEY_VALUE_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)")
 ADDRESS_RE = re.compile(r"^0b([0-9a-fA-F]{4})([0-9a-fA-F]{2})$")
