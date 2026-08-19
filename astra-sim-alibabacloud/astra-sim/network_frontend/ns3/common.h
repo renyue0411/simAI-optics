@@ -110,11 +110,19 @@ uint32_t rnic_deadline_rttvar_multiplier = 4;
 // size and retry bound are derived inside the RNIC model.
 uint32_t rnic_ack_recovery_enable = 1;
 uint64_t rnic_ack_flush_guard_ns = 10000;
-// Mode-2 commodity RNIC RC reliability. These map conceptually to an RC QP
-// local ACK timeout and retry count; the first simulator interface uses ns.
+// Common RC reliability configuration. Mode 0/2 use a vanilla, schedule-unaware
+// local ACK timeout/retry policy. Mode 1 uses its RNIC schedule-aware ACK
+// recovery when enabled; disabling that recovery falls back to vanilla RC.
 uint32_t rc_ack_retry_enable = 1;
 uint64_t rc_ack_timeout_ns = 100000;
 uint32_t rc_retry_count = 7;
+// Lightweight instrumentation for one selected TX QP. Disabled by default.
+// sport=0 is a wildcard; src/dst are exact endpoint ids.
+uint32_t rnic_qp_state_trace_enable = 0;
+uint64_t rnic_qp_state_trace_interval_ns = 50000;
+uint32_t rnic_qp_state_trace_src = 0;
+uint32_t rnic_qp_state_trace_dst = 0;
+uint32_t rnic_qp_state_trace_sport = 0;
 // Mode-2 userspace bootstrap timing estimate.  This is deliberately not
 // populated from simulator pairRtt/QP internals; future rdma-core deployments
 // can supply the same value from configuration/calibration.
@@ -764,6 +772,27 @@ bool ReadConf(string network_topo,string network_conf) {
 
   } else if (key.compare("RC_RETRY_COUNT") == 0) {
   conf >> rc_retry_count;
+
+  } else if (key.compare("RNIC_QP_STATE_TRACE_ENABLE") == 0) {
+  conf >> rnic_qp_state_trace_enable;
+
+  } else if (key.compare("RNIC_QP_STATE_TRACE_INTERVAL_NS") == 0) {
+  conf >> rnic_qp_state_trace_interval_ns;
+  if (rnic_qp_state_trace_interval_ns == 0) {
+    NS_ABORT_MSG("RNIC_QP_STATE_TRACE_INTERVAL_NS must be positive");
+  }
+
+  } else if (key.compare("RNIC_QP_STATE_TRACE_SRC") == 0) {
+  conf >> rnic_qp_state_trace_src;
+
+  } else if (key.compare("RNIC_QP_STATE_TRACE_DST") == 0) {
+  conf >> rnic_qp_state_trace_dst;
+
+  } else if (key.compare("RNIC_QP_STATE_TRACE_SPORT") == 0) {
+  conf >> rnic_qp_state_trace_sport;
+  if (rnic_qp_state_trace_sport > 65535) {
+    NS_ABORT_MSG("RNIC_QP_STATE_TRACE_SPORT must fit in uint16_t");
+  }
 
   } else if (key.compare("USERSPACE_INITIAL_RTT_NS") == 0) {
   conf >> userspace_initial_rtt_ns;
@@ -1582,10 +1611,27 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
           rnic_deadline_rttvar_multiplier);
       rdmaHw->ConfigureRnicAckRecovery(
           rdma_transport_mode == 1 && rnic_ack_recovery_enable != 0);
+      RdmaHw::RcRetryPolicy rcRetryPolicy = RdmaHw::RC_RETRY_DISABLED;
+      if (rc_ack_retry_enable != 0) {
+        if (rdma_transport_mode == 1 && rnic_ack_recovery_enable != 0) {
+          rcRetryPolicy = RdmaHw::RC_RETRY_SCHEDULE_AWARE;
+        } else {
+          // Mode 0 is the conventional schedule-unaware RC baseline. Mode 2
+          // uses the same RNIC timer below its userspace admission layer.
+          // A Mode-1 ACK-recovery ablation also falls back to vanilla RC.
+          rcRetryPolicy = RdmaHw::RC_RETRY_VANILLA;
+        }
+      }
       rdmaHw->ConfigureRcAckRetry(
-          rdma_transport_mode == 2 && rc_ack_retry_enable != 0,
+          rcRetryPolicy,
           rc_ack_timeout_ns,
           rc_retry_count);
+      rdmaHw->ConfigureQpStateTrace(
+          rnic_qp_state_trace_enable != 0,
+          rnic_qp_state_trace_interval_ns,
+          rnic_qp_state_trace_src,
+          rnic_qp_state_trace_dst,
+          static_cast<uint16_t>(rnic_qp_state_trace_sport));
       Ptr<RdmaDriver> rdma = CreateObject<RdmaDriver>();
       Ptr<Node> node = n.Get(i);
       rdma->SetNode(node);

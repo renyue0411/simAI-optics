@@ -13,3 +13,6 @@ experiments/
 __pycache__/
 *.py[cod]
 /readme.md
+
+# Local project notes
+summary.md
