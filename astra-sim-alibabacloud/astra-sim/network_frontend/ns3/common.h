@@ -300,10 +300,15 @@ void monitor_bw(FILE* bw_output, NodeContainer *n){
 		}else if(n->Get(i)->GetNodeType() == 2){ 
 			Ptr<NVSwitchNode> sw = DynamicCast<NVSwitchNode>(n->Get(i));
 			sw->PrintSwitchBw(bw_output, bw_mon_interval);
-		}else{ 
-			Ptr<Node> host = n->Get(i);
-			host->GetObject<RdmaDriver>()->m_rdma->PrintHostBW(bw_output, bw_mon_interval);
-		}
+    }else if(n->Get(i)->GetNodeType() == 0){
+        Ptr<Node> host = n->Get(i);
+        Ptr<RdmaDriver> driver = host->GetObject<RdmaDriver>();
+
+        if(driver != nullptr && driver->m_rdma != nullptr){
+            driver->m_rdma->PrintHostBW(
+                bw_output, bw_mon_interval);
+        }
+    }
 	}
 	Simulator::Schedule(MicroSeconds(bw_mon_interval), &monitor_bw, bw_output, n);
 }
@@ -1129,6 +1134,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 			n.Add(sw);
 		}else if(node_type[i] == 3){
 			Ptr<OcsNode> ocs = CreateObject<OcsNode>();
+			ocs->ConfigureDropTrace(enable_trace != 0);
 			n.Add(ocs);
 		}
 	}
@@ -1613,12 +1619,14 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
           rdma_transport_mode == 1 && rnic_ack_recovery_enable != 0);
       RdmaHw::RcRetryPolicy rcRetryPolicy = RdmaHw::RC_RETRY_DISABLED;
       if (rc_ack_retry_enable != 0) {
-        if (rdma_transport_mode == 1 && rnic_ack_recovery_enable != 0) {
+        if (rdma_transport_mode == 1) {
+          // Mode 1 is schedule-aware regardless of whether the optional
+          // ACK-recovery mechanism is enabled. Planned OCS OFF time must not
+          // consume the ordinary RC retry budget.
           rcRetryPolicy = RdmaHw::RC_RETRY_SCHEDULE_AWARE;
         } else {
           // Mode 0 is the conventional schedule-unaware RC baseline. Mode 2
           // uses the same RNIC timer below its userspace admission layer.
-          // A Mode-1 ACK-recovery ablation also falls back to vanilla RC.
           rcRetryPolicy = RdmaHw::RC_RETRY_VANILLA;
         }
       }
@@ -1626,6 +1634,8 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
           rcRetryPolicy,
           rc_ack_timeout_ns,
           rc_retry_count);
+      rdmaHw->ConfigureFlowRxTrace(enable_trace != 0);
+      rdmaHw->ConfigureRcEventTrace(enable_trace != 0);
       rdmaHw->ConfigureQpStateTrace(
           rnic_qp_state_trace_enable != 0,
           rnic_qp_state_trace_interval_ns,

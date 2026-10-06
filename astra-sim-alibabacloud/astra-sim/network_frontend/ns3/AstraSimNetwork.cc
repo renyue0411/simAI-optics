@@ -13,6 +13,7 @@
 *limitations under the License.
 */
 
+#include <cstdlib>
 #include "astra-sim/system/AstraNetworkAPI.hh"
 #include "astra-sim/system/Sys.hh"
 #include "astra-sim/system/RecvPacketEventHadndlerData.hh"
@@ -23,6 +24,7 @@
 #include "ns3/csma-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/network-module.h"
+#include "ns3/rdma-hw.h"
 #include "entry.h"
 #include <execinfo.h>
 #include <fstream>
@@ -227,7 +229,14 @@ struct StaticFlowInput {
 };
 
 uint32_t static_flow_expected = 0;
+
+// Historical name retained for compatibility:
+// static_flow_completed counts TERMINATED flows
+// (successful completion + terminal failure).
 uint32_t static_flow_completed = 0;
+
+uint32_t static_flow_succeeded = 0;
+uint32_t static_flow_failed = 0;
 typedef std::pair<uint16_t, std::pair<uint32_t, uint32_t>> StaticFlowKey;
 std::map<StaticFlowKey, uint32_t> static_flow_indices;
 std::set<StaticFlowKey> static_flow_sent_logged;
@@ -291,6 +300,9 @@ bool LoadStaticFlows(const std::string &path,
 }
 
 void StaticQpFinish(FILE *fout, Ptr<RdmaQueuePair> q) {
+#ifdef NS3_MTP
+  MtpInterface::explicitCriticalSection cs;
+#endif
   const uint32_t sid = ip_to_node_id(q->sip);
   const uint32_t did = ip_to_node_id(q->dip);
   const uint64_t base_rtt = pairRtt[sid][did];
@@ -328,17 +340,57 @@ void StaticQpFinish(FILE *fout, Ptr<RdmaQueuePair> q) {
     static_flow_indices.erase(it);
   }
 
+  // QpComplete trace is also raised for terminal Mode-0/1
+  // QP errors.  RC retry exhaustion is therefore a terminal
+  // flow failure, not a successful end-to-end completion.
+  //
+  // Keep static_flow_completed as the number of TERMINATED
+  // flows so static-flow execution can still finish cleanly
+  // after transport failures.
   ++static_flow_completed;
-  std::cout << "[STATIC FLOW COMPLETE]"
-            << " index=" << flow_index
-            << " t_ns=" << Simulator::Now().GetNanoSeconds()
-            << " src=" << sid
-            << " dst=" << did
-            << " sport=" << q->sport
-            << " dport=" << q->dport
-            << " bytes=" << q->m_size
-            << " completed=" << static_flow_completed
-            << "/" << static_flow_expected << std::endl;
+
+  if (q->m_rcRetryExhausted) {
+    ++static_flow_failed;
+
+    std::cout << "[STATIC FLOW FAILED]"
+              << " index=" << flow_index
+              << " t_ns=" << Simulator::Now().GetNanoSeconds()
+              << " src=" << sid
+              << " dst=" << did
+              << " sport=" << q->sport
+              << " dport=" << q->dport
+              << " bytes=" << q->m_size
+              << " reason=rc_retry_exhausted"
+              << " failed=" << static_flow_failed
+              << "/" << static_flow_expected
+              << " succeeded=" << static_flow_succeeded
+              << "/" << static_flow_expected
+              << " terminated=" << static_flow_completed
+              << "/" << static_flow_expected
+              << std::endl;
+  } else {
+    ++static_flow_succeeded;
+
+    std::cout << "[STATIC FLOW COMPLETE]"
+              << " index=" << flow_index
+              << " t_ns=" << Simulator::Now().GetNanoSeconds()
+              << " src=" << sid
+              << " dst=" << did
+              << " sport=" << q->sport
+              << " dport=" << q->dport
+              << " bytes=" << q->m_size
+              << " succeeded=" << static_flow_succeeded
+              << "/" << static_flow_expected
+              << " failed=" << static_flow_failed
+              << "/" << static_flow_expected
+              << " terminated=" << static_flow_completed
+              << "/" << static_flow_expected
+              << std::endl;
+  }
+
+#ifdef NS3_MTP
+  cs.ExitSection();
+#endif
 }
 
 void StaticSendFinish(FILE *, Ptr<RdmaQueuePair> q) {
@@ -348,6 +400,10 @@ void StaticSendFinish(FILE *, Ptr<RdmaQueuePair> q) {
   if (q == nullptr || q->GetUnpostedBytes() != 0) {
     return;
   }
+
+#ifdef NS3_MTP
+  MtpInterface::explicitCriticalSection cs;
+#endif
 
   const uint32_t sid = ip_to_node_id(q->sip);
   const uint32_t did = ip_to_node_id(q->dip);
@@ -376,11 +432,35 @@ void StaticSendFinish(FILE *, Ptr<RdmaQueuePair> q) {
             << " sport=" << q->sport
             << " bytes=" << q->m_size
             << std::endl;
+
+#ifdef NS3_MTP
+  cs.ExitSection();
+#endif
+}
+
+
+void StaticProgressHeartbeat() {
+  std::cout << "[STATIC SIM PROGRESS]"
+            << " t_ns=" << Simulator::Now().GetNanoSeconds()
+            << " sent=" << static_flow_sent_logged.size()
+            << " succeeded=" << static_flow_succeeded
+            << " failed=" << static_flow_failed
+            << " terminated=" << static_flow_completed
+            << " expected=" << static_flow_expected
+            << std::endl;
+
+  if (static_flow_completed < static_flow_expected) {
+    Simulator::Schedule(
+        MilliSeconds(1),
+        &StaticProgressHeartbeat);
+  }
 }
 
 bool InstallStaticFlows(const std::vector<StaticFlowInput> &flows) {
   static_flow_expected = static_cast<uint32_t>(flows.size());
   static_flow_completed = 0;
+  static_flow_succeeded = 0;
+  static_flow_failed = 0;
   static_flow_indices.clear();
   static_flow_sent_logged.clear();
 
@@ -541,10 +621,22 @@ int main(int argc, char *argv[]) {
       return 2;
     }
 
+    schedule_monitor();
+
+    if (std::getenv("SIM_STATIC_PROGRESS") != NULL) {
+      Simulator::Schedule(
+          MilliSeconds(1),
+          &StaticProgressHeartbeat);
+    }
+
     Simulator::Stop(Seconds(user_param.static_stop_time));
     Simulator::Run();
+    ns3::RdmaHw::PrintGlobalEcnUsefulStats();
     DumpOcsStatsFinal();
-    std::cout << "[STATIC FLOW SUMMARY] completed=" << static_flow_completed
+    std::cout << "[STATIC FLOW SUMMARY]"
+              << " succeeded=" << static_flow_succeeded
+              << " failed=" << static_flow_failed
+              << " terminated=" << static_flow_completed
               << " expected=" << static_flow_expected
               << " stop_time_s=" << user_param.static_stop_time << std::endl;
     Simulator::Destroy();
