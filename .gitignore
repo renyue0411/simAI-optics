@@ -8,7 +8,10 @@ test/log/
 *.log
 .cur*
 .DS_Store
-experiments/
+experiments/analysis
+experiments/logs
+experiments/runs
+experiments/runs_dashboard
 # Python bytecode
 __pycache__/
 *.py[cod]
