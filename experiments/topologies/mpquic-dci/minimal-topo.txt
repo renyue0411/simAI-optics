@@ -1,0 +1,10 @@
+# Same 8-column node header and 7-column link syntax as the RDMA topology.
+# node_count gpus/server nvswitch normal_eps timeflow_eps ocs links gpu_type
+# Gateways 0 and 1; OCS ID 2 is a logical schedule controller in this first model.
+3 1 0 0 0 1 2 A100
+2
+# source destination source_port destination_port rate one_way_delay error
+# path 0: schedule-gated optical abstraction
+0 1 0 0 1Gbps 5ms 0
+# path 1: always available EPS abstraction
+0 1 1 1 1Gbps 10ms 0

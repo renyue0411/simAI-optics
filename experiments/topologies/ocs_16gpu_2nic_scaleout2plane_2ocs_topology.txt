@@ -1,0 +1,72 @@
+30 4 4 8 2 56 A100
+16 17 18 19 20 21 22 23 24 25 26 27
+28 29
+
+# Scale-up: GPU NIC 0 / Plane 0 <-> NVSwitch
+0 16 0-0 0 200Gbps 0.001ms 0
+1 16 0-0 1 200Gbps 0.001ms 0
+2 16 0-0 2 200Gbps 0.001ms 0
+3 16 0-0 3 200Gbps 0.001ms 0
+4 17 0-0 0 200Gbps 0.001ms 0
+5 17 0-0 1 200Gbps 0.001ms 0
+6 17 0-0 2 200Gbps 0.001ms 0
+7 17 0-0 3 200Gbps 0.001ms 0
+8 18 0-0 0 200Gbps 0.001ms 0
+9 18 0-0 1 200Gbps 0.001ms 0
+10 18 0-0 2 200Gbps 0.001ms 0
+11 18 0-0 3 200Gbps 0.001ms 0
+12 19 0-0 0 200Gbps 0.001ms 0
+13 19 0-0 1 200Gbps 0.001ms 0
+14 19 0-0 2 200Gbps 0.001ms 0
+15 19 0-0 3 200Gbps 0.001ms 0
+
+# Scale-out Plane 0: GPU NIC 1 / Plane 0
+0 20 1-0 10 50Gbps 0.001ms 0
+1 20 1-0 11 50Gbps 0.001ms 0
+2 20 1-0 12 50Gbps 0.001ms 0
+3 20 1-0 13 50Gbps 0.001ms 0
+4 21 1-0 10 50Gbps 0.001ms 0
+5 21 1-0 11 50Gbps 0.001ms 0
+6 21 1-0 12 50Gbps 0.001ms 0
+7 21 1-0 13 50Gbps 0.001ms 0
+8 22 1-0 10 50Gbps 0.001ms 0
+9 22 1-0 11 50Gbps 0.001ms 0
+10 22 1-0 12 50Gbps 0.001ms 0
+11 22 1-0 13 50Gbps 0.001ms 0
+12 23 1-0 10 50Gbps 0.001ms 0
+13 23 1-0 11 50Gbps 0.001ms 0
+14 23 1-0 12 50Gbps 0.001ms 0
+15 23 1-0 13 50Gbps 0.001ms 0
+
+# Scale-out Plane 1: GPU NIC 1 / Plane 1
+0 24 1-1 10 50Gbps 0.001ms 0
+1 24 1-1 11 50Gbps 0.001ms 0
+2 24 1-1 12 50Gbps 0.001ms 0
+3 24 1-1 13 50Gbps 0.001ms 0
+4 25 1-1 10 50Gbps 0.001ms 0
+5 25 1-1 11 50Gbps 0.001ms 0
+6 25 1-1 12 50Gbps 0.001ms 0
+7 25 1-1 13 50Gbps 0.001ms 0
+8 26 1-1 10 50Gbps 0.001ms 0
+9 26 1-1 11 50Gbps 0.001ms 0
+10 26 1-1 12 50Gbps 0.001ms 0
+11 26 1-1 13 50Gbps 0.001ms 0
+12 27 1-1 10 50Gbps 0.001ms 0
+13 27 1-1 11 50Gbps 0.001ms 0
+14 27 1-1 12 50Gbps 0.001ms 0
+15 27 1-1 13 50Gbps 0.001ms 0
+
+# Plane 0 EPS <-> OCS 28
+20 28 0 0 25Gbps 0.001ms 0
+21 28 0 1 25Gbps 0.001ms 0
+22 28 0 2 25Gbps 0.001ms 0
+23 28 0 3 25Gbps 0.001ms 0
+
+# Plane 1 EPS <-> OCS 29
+24 29 0 0 25Gbps 0.001ms 0
+25 29 0 1 25Gbps 0.001ms 0
+26 29 0 2 25Gbps 0.001ms 0
+27 29 0 3 25Gbps 0.001ms 0
+
+# GPU-side port token format: <nic_id>-<plane_id>.
+# NIC 0 carries scale-up; NIC 1 is broken out into scale-out Plane 0 and Plane 1.

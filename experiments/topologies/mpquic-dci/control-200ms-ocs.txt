@@ -1,0 +1,4 @@
+# Control: repeated pairing, no optical unavailability.
+SCHEDULE OCS=2 EPOCH_US=0 SLICE_US=200000 SWITCH_US=0
+SLICE 0 PAIRS=0-1
+SLICE 1 PAIRS=0-1

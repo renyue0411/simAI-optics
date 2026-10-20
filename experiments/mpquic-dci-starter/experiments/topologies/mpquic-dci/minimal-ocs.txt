@@ -1,0 +1,6 @@
+# Same compact syntax as TdmController::LoadCompactSchedule.
+# The last SWITCH_US of each SLICE is unavailable in both directions.
+# These 1 s slices keep the first 16 MiB smoke flow outside a cutover.
+SCHEDULE OCS=2 EPOCH_US=0 SLICE_US=1000000 SWITCH_US=1000
+SLICE 0 PAIRS=0-1
+SLICE 1 PAIRS=0-1

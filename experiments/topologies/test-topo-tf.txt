@@ -1,0 +1,95 @@
+# total gpus/server nvswitch n-eps tf-eps ocs link gpu_type
+32 4 4 1 1 10 64 A100
+16 17 18 19
+20
+21
+22 23 24 25 26 27 28 29 30 31
+
+# Scale-up: GPU NIC 0 / Plane 0 <-> NVSwitch
+0 16 0 0 200Gbps 0.001ms 0
+1 16 0 1 200Gbps 0.001ms 0
+2 16 0 2 200Gbps 0.001ms 0
+3 16 0 3 200Gbps 0.001ms 0
+4 17 0 0 200Gbps 0.001ms 0
+5 17 0 1 200Gbps 0.001ms 0
+6 17 0 2 200Gbps 0.001ms 0
+7 17 0 3 200Gbps 0.001ms 0
+8 18 0 0 200Gbps 0.001ms 0
+9 18 0 1 200Gbps 0.001ms 0
+10 18 0 2 200Gbps 0.001ms 0
+11 18 0 3 200Gbps 0.001ms 0
+12 19 0 0 200Gbps 0.001ms 0
+13 19 0 1 200Gbps 0.001ms 0
+14 19 0 2 200Gbps 0.001ms 0
+15 19 0 3 200Gbps 0.001ms 0
+
+# Scale-out Plane 0: GPU NIC 1 / Plane 0
+# Rail 0:
+0 22 1-0 0 50Gbps 0.001ms 0
+4 22 1-0 1 50Gbps 0.001ms 0
+8 22 1-0 2 50Gbps 0.001ms 0
+12 22 1-0 3 50Gbps 0.001ms 0
+# Rail 1:
+1 23 1-0 0 50Gbps 0.001ms 0
+5 23 1-0 1 50Gbps 0.001ms 0
+9 23 1-0 2 50Gbps 0.001ms 0
+13 23 1-0 3 50Gbps 0.001ms 0
+# Rail 2:
+2 24 1-0 0 50Gbps 0.001ms 0
+6 24 1-0 1 50Gbps 0.001ms 0
+10 24 1-0 2 50Gbps 0.001ms 0
+14 24 1-0 3 50Gbps 0.001ms 0
+# Rail 3:
+3 25 1-0 0 50Gbps 0.001ms 0
+7 25 1-0 1 50Gbps 0.001ms 0
+11 25 1-0 2 50Gbps 0.001ms 0
+15 25 1-0 3 50Gbps 0.001ms 0
+
+# Scale-out Plane 1: GPU NIC 1 / Plane 1
+# Rail 0:
+0 26 1-1 0 50Gbps 0.001ms 0
+4 26 1-1 1 50Gbps 0.001ms 0
+8 26 1-1 2 50Gbps 0.001ms 0
+12 26 1-1 3 50Gbps 0.001ms 0
+# Rail 1:
+1 27 1-1 0 50Gbps 0.001ms 0
+5 27 1-1 1 50Gbps 0.001ms 0
+9 27 1-1 2 50Gbps 0.001ms 0
+13 27 1-1 3 50Gbps 0.001ms 0
+# Rail 2:
+2 28 1-1 0 50Gbps 0.001ms 0
+6 28 1-1 1 50Gbps 0.001ms 0
+10 28 1-1 2 50Gbps 0.001ms 0
+14 28 1-1 3 50Gbps 0.001ms 0
+# Rail 3:
+3 29 1-1 0 50Gbps 0.001ms 0
+7 29 1-1 1 50Gbps 0.001ms 0
+11 29 1-1 2 50Gbps 0.001ms 0
+15 29 1-1 3 50Gbps 0.001ms 0
+
+# Plane 0 OCS <-> OCS
+22 30 4 0 50Gbps 0.001ms 0
+23 30 4 1 50Gbps 0.001ms 0
+24 30 4 2 50Gbps 0.001ms 0
+25 30 4 3 50Gbps 0.001ms 0
+
+# Plane 0 OCS <-> EPS
+22 20 5 0 50Gbps 0.001ms 0
+23 20 5 1 50Gbps 0.001ms 0
+24 20 5 2 50Gbps 0.001ms 0
+25 20 5 3 50Gbps 0.001ms 0
+
+# Plane 1 OCS <-> OCS
+26 31 4 0 50Gbps 0.001ms 0
+27 31 4 1 50Gbps 0.001ms 0
+28 31 4 2 50Gbps 0.001ms 0
+29 31 4 3 50Gbps 0.001ms 0
+
+# Plane 1 OCS <-> EPS
+26 21 5 0 50Gbps 0.001ms 0
+27 21 5 1 50Gbps 0.001ms 0
+28 21 5 2 50Gbps 0.001ms 0
+29 21 5 3 50Gbps 0.001ms 0
+
+# GPU-side port token format: <nic_id>-<plane_id>.
+# NIC 0 carries scale-up; NIC 1 is broken out into scale-out Plane 0 and Plane 1.
