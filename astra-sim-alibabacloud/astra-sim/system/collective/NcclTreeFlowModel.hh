@@ -61,6 +61,18 @@ class NcclTreeFlowModel : public Algorithm {
   std::map<int, int>* zero_latency_packets;
   std::map<int, int>* non_zero_latency_packets;
   MockNccl::FlowModels _flow_models; 
+  // Optional diagnostics for first-hop dependencies between ring fragments.
+  bool pipeline_trace_enabled = false;
+  std::map<int, Tick> fragment_previous_received;
+  std::map<int, Tick> fragment_slot_received;
+  std::map<int, Tick> fragment_eligible;
+  uint64_t slot_dependency_flows = 0;
+  uint64_t slot_late_flows = 0;
+  Tick slot_wait_sum_ticks = 0;
+  Tick slot_wait_max_ticks = 0;
+  uint64_t first_hop_submissions = 0;
+  Tick eligible_to_submit_sum_ticks = 0;
+  Tick eligible_to_submit_max_ticks = 0;
   uint32_t m_channels;
   uint32_t len_channel;
   MockNccl::NcclQps* pQps;
@@ -90,6 +102,7 @@ class NcclTreeFlowModel : public Algorithm {
   virtual int get_non_zero_latency_packets();
   void insert_packets(int channel_id, int flow_id);
   void init_indegree_mapping();
+  bool is_fragment_first_hop(int channel_id, int flow_id) const;
   bool ready(int channel_id, int flow_id);
   bool recv_ready(int channel_id, int flow_id);
   bool init_recv_ready();

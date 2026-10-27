@@ -20,8 +20,45 @@
 #include <queue>
 #include <cmath>
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <deque>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
 #include "astra-sim/system/MockNcclLog.h"
 using namespace std;
+
+namespace {
+
+uint64_t ReadPositiveEnvironmentValue(const char* name, uint64_t fallback) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return fallback;
+  }
+
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(raw, &end, 10);
+  if (errno != 0 || end == raw || *end != '\0' || parsed == 0 ||
+      raw[0] == '-') {
+    throw std::invalid_argument(
+        std::string(name) + " must be a positive integer, got: " + raw);
+  }
+  return static_cast<uint64_t>(parsed);
+}
+
+int ReadChannelCount(int fallback) {
+  const uint64_t parsed = ReadPositiveEnvironmentValue(
+      "SIMAI_NCCL_CHANNELS", static_cast<uint64_t>(fallback));
+  if (parsed > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+    throw std::out_of_range("SIMAI_NCCL_CHANNELS is too large");
+  }
+  return static_cast<int>(parsed);
+}
+
+}  // namespace
+
 namespace MockNccl {
   MockNcclGroup::MockNcclGroup(int _ngpus,int _gpus_per_nodes,int _TP_size,int _DP_size,int _PP_size,int _EP_size,int _DP_EP_size,std::vector<int>_NVSwitch,GPUType _gpu_type):g_flow_id(0),gpu_type(_gpu_type){
     /*init groups
@@ -216,7 +253,8 @@ namespace MockNccl {
     for (int i = 0; i < nlocalranks; i++){
       localranks.push_back(ranks[i]);
     }
-    for(int i =0;i<nlocalranks;i++){
+    const int channel_count = ReadChannelCount(nlocalranks);
+    for(int i = 0; i < channel_count; i++){
       std::vector<int> vec;
       for (int j = 0; j < nlocalranks; ++j) {
         vec.push_back(localranks[(i + j) % nlocalranks]);

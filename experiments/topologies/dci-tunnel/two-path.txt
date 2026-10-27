@@ -1,0 +1,8 @@
+# nodes, logical gateways, links
+4 2 4
+1 2
+# src dst rate one-way-delay packet-error-rate
+0 1 400Gbps 2us 0
+1 2 100Gbps 5ms 0
+1 2 200Gbps 10ms 0
+2 3 400Gbps 2us 0

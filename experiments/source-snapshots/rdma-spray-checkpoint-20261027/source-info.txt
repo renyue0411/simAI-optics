@@ -1,0 +1,7 @@
+Actual simulation source: astra-sim-alibabacloud/extern/network_backend/ns3-interface/simulation
+Parent repository HEAD:
+bde7cfdbf2950dfac0838b2ad4ec9e4459689524
+NS-3 submodule HEAD:
+3552fabc906bf78147e169ac44b7eea5e0d77a59
+Source archive SHA256:
+4b324ebf61a87fe863c7b982486496b2b42ef6f1845ac11361ad0284a4867e69  experiments/source-snapshots/rdma-spray-checkpoint-20261027/ns3-active-source.tar.gz

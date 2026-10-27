@@ -18,6 +18,9 @@
 #include "astra-sim/system/PhyMultiThread.hh"
 #endif
 #include<chrono>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 
 #include "NcclTreeFlowModel.hh"
 #include "astra-sim/system/PacketBundle.hh"
@@ -50,6 +53,10 @@ NcclTreeFlowModel::NcclTreeFlowModel(
   this->logicalTopology = ring_topology;
   this->data_size = data_size;
   this->nodes_in_ring = ring_topology->get_nodes_in_ring();
+  const char* trace_setting = std::getenv("SIMAI_NCCL_PIPELINE_TRACE");
+  pipeline_trace_enabled =
+      trace_setting != nullptr && std::strcmp(trace_setting, "1") == 0 &&
+      type == ComType::All_Reduce && nodes_in_ring > 1;
   this->parallel_reduce = 1;
   this->toggle = false;
   this->name = Name::Ring;
@@ -125,6 +132,18 @@ void NcclTreeFlowModel::init_indegree_mapping(){
     if(tree_it->second.src!=id) continue;
     indegree_mapping[tree_it->first.second] = tree_it->second.parent_flow_id.size();
   }
+}
+
+bool NcclTreeFlowModel::is_fragment_first_hop(int channel_id,
+                                               int flow_id) const {
+  const auto it = _flow_models.find(std::make_pair(channel_id, flow_id));
+  if (it == _flow_models.end() || it->second.src != id ||
+      it->second.conn_type != "RING") {
+    return false;
+  }
+  const int steps_per_fragment = 2 * (nodes_in_ring - 1);
+  return steps_per_fragment > 0 &&
+         it->second.chunk_id % steps_per_fragment == 0;
 }
 
 int NcclTreeFlowModel::get_non_zero_latency_packets() {
@@ -206,7 +225,41 @@ void NcclTreeFlowModel::run(EventType event, CallData* data) {
         cs.ExitSection();
         break;
       }
+      if (pipeline_trace_enabled &&
+          is_fragment_first_hop(channel_id, next_flow_id)) {
+        const auto& child = _flow_models.at(
+            std::make_pair(channel_id, next_flow_id));
+        const auto parent = _flow_models.find(
+            std::make_pair(channel_id, received_flow_id));
+        if (parent != _flow_models.end()) {
+          const Tick now = Sys::boostedTick();
+          const int steps_per_fragment = 2 * (nodes_in_ring - 1);
+          if (parent->second.chunk_id + steps_per_fragment ==
+              child.chunk_id) {
+            fragment_previous_received[next_flow_id] = now;
+          } else {
+            fragment_slot_received[next_flow_id] = now;
+          }
+        }
+      }
       if (--indegree_mapping[next_flow_id] == 0) {
+        if (pipeline_trace_enabled &&
+            is_fragment_first_hop(channel_id, next_flow_id)) {
+          fragment_eligible[next_flow_id] = Sys::boostedTick();
+          const auto previous = fragment_previous_received.find(next_flow_id);
+          const auto slot = fragment_slot_received.find(next_flow_id);
+          if (slot != fragment_slot_received.end()) {
+            ++slot_dependency_flows;
+          }
+          if (previous != fragment_previous_received.end() &&
+              slot != fragment_slot_received.end() &&
+              slot->second > previous->second) {
+            const Tick extra_wait = slot->second - previous->second;
+            ++slot_late_flows;
+            slot_wait_sum_ticks += extra_wait;
+            slot_wait_max_ticks = std::max(slot_wait_max_ticks, extra_wait);
+          }
+        }
         MockNccl::SingleFlow cur_flow = _flow_models[std::make_pair(channel_id, next_flow_id)];
           cs.ExitSection();
           insert_packets(channel_id, next_flow_id);
@@ -592,6 +645,17 @@ bool NcclTreeFlowModel::ready(int channel_id, int flow_id) {
       packet.preferred_dest,
       channel_id,
       EventType::PacketSentFinshed);
+  if (pipeline_trace_enabled && is_fragment_first_hop(channel_id, flow_id)) {
+    ++first_hop_submissions;
+    const auto eligible = fragment_eligible.find(flow_id);
+    if (eligible != fragment_eligible.end() &&
+        Sys::boostedTick() >= eligible->second) {
+      const Tick submit_gap = Sys::boostedTick() - eligible->second;
+      eligible_to_submit_sum_ticks += submit_gap;
+      eligible_to_submit_max_ticks =
+          std::max(eligible_to_submit_max_ticks, submit_gap);
+    }
+  }
   stream->owner->front_end_sim_send(
       0,
       Sys::dummy_data,
@@ -607,6 +671,19 @@ bool NcclTreeFlowModel::ready(int channel_id, int flow_id) {
 
 void NcclTreeFlowModel::exit() {
   MockNcclLog* NcclLog = MockNcclLog::getInstance();
+  if (pipeline_trace_enabled) {
+    std::cout << "NCCL_PIPELINE_TIMING"
+              << " node=" << id
+              << " first_hop_submissions=" << first_hop_submissions
+              << " slot_dependency_flows=" << slot_dependency_flows
+              << " slot_late_flows=" << slot_late_flows
+              << " slot_wait_sum_ticks=" << slot_wait_sum_ticks
+              << " slot_wait_max_ticks=" << slot_wait_max_ticks
+              << " eligible_to_submit_sum_ticks="
+              << eligible_to_submit_sum_ticks
+              << " eligible_to_submit_max_ticks="
+              << eligible_to_submit_max_ticks << std::endl;
+  }
   #ifdef PHY_MTP
   auto now = std::chrono::system_clock::now();
   auto now_us =

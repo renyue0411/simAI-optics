@@ -3,6 +3,7 @@ This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
 *******************************************************************************/
 
+#include <stdexcept>
 #include "Sys.hh"
 #include "BaseStream.hh"
 #include "DataSet.hh"
@@ -1196,9 +1197,16 @@ CollectivePhase Sys::generate_collective_phase(
                   channels = mock_nccl_comms[comm_ps]->get_rings();
                   cs.ExitSection();
                 }
+                int ring_channel_count = 0;
+                if (RingFlowModels != nullptr) {
+                  for (const auto& flow : *RingFlowModels) {
+                    ring_channel_count = std::max(
+                        ring_channel_count, flow.second.channel_id + 1);
+                  }
+                }
                 NcclLog->writeLog(NcclLogLevel::DEBUG,"rank %d generate FlowModels",id);
                 if(RingFlowModels != nullptr){
-                  NcclLog->writeLog(NcclLogLevel::DEBUG,"rank %d NcclMock generate  %d channel and flow model count:  %d",id,channels.size(),RingFlowModels->size());
+                  NcclLog->writeLog(NcclLogLevel::DEBUG,"rank %d NcclMock generate  %d channel and flow model count:  %d",id,ring_channel_count,RingFlowModels->size());
                   for (auto flow : *RingFlowModels) {
                     int prev;
                     int parent_flow_id;
@@ -1234,7 +1242,7 @@ CollectivePhase Sys::generate_collective_phase(
                         injection_policy,
                         boost_mode,
                         RingFlowModels,
-                        channels.size()));
+                        ring_channel_count));
                 return vn;
               } else if(nccl_info->algorithm == NCCL_ALGO_TREE) {
                 std::shared_ptr<MockNccl::FlowModels> TreeFlowModels;
@@ -1397,8 +1405,26 @@ bool Sys::mock_nccl_comms_init(){
     return true;
 }
 
-struct MockNccl::ncclInfo* Sys::get_nccl_Info(ParallelStrategy comm_ps, uint64_t data_size, ComType collective_type) {
-    return mock_nccl_comms[comm_ps]->get_algo_proto_info(data_size, collective_type );
+// struct MockNccl::ncclInfo* Sys::get_nccl_Info(ParallelStrategy comm_ps, uint64_t data_size, ComType collective_type) {
+//     return mock_nccl_comms[comm_ps]->get_algo_proto_info(data_size, collective_type );
+// }
+
+struct MockNccl::ncclInfo*
+Sys::get_nccl_Info(ParallelStrategy comm_ps,
+                   uint64_t data_size,
+                   ComType collective_type) {
+  if (GlobalGroup == nullptr) {
+    mock_nccl_grobal_group_init();
+  }
+  if (mock_nccl_comms.empty()) {
+    mock_nccl_comms_init();
+  }
+
+  auto comm = mock_nccl_comms.find(comm_ps);
+  if (comm == mock_nccl_comms.end() || comm->second == nullptr) {
+    throw std::runtime_error("MockNCCL communicator unavailable for requested group");
+  }
+  return comm->second->get_algo_proto_info(data_size, collective_type);
 }
 
 std::shared_ptr<void> Sys::generate_flow_model(ParallelStrategy comm_ps, uint64_t data_size, ComType collective_type) {

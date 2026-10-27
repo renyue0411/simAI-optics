@@ -19,6 +19,11 @@
 #undef PGO_TRAINING
 #define PATH_TO_PGO_CONFIG "path_to_pgo_config"
 #define _QPS_PER_CONNECTION_  1
+#include <cstdlib>
+#include <deque>
+#include <limits>
+#include <stdexcept>
+#include <tuple>
 #include "common.h"
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
@@ -104,9 +109,146 @@ bool is_receive_finished(int src,int dst,AstraSim::ncclFlowTag flowTag){
   return false;
 }
 
+// Figure 2: one long-lived simulated RC QP per (sender, receiver, channel,
+// QP index). The QP's actual UDP source port is stable for its entire life.
+// Each NCCL fragment becomes one posted byte range on that QP.
+using Figure2Key = std::tuple<int, int, int, int>;
+using Figure2WireKey = std::tuple<uint32_t, uint32_t, uint16_t, uint16_t, uint16_t>;
+struct Figure2Fragment {
+  uint64_t endSeq;
+  uint64_t bytes;
+  AstraSim::ncclFlowTag flowTag;
+};
+struct Figure2Qp {
+  Ptr<RdmaQueuePair> qp;
+  uint64_t reservedBytes = 0;
+  std::deque<Figure2Fragment> txPending;
+  std::deque<Figure2Fragment> rxPending;
+};
+std::map<Figure2Key, Figure2Qp> figure2Qps;
+std::map<Figure2WireKey, Figure2Key> figure2WireQps;
+
+int GetFigure2QpsPerChannel() {
+  static const int qps = []() {
+    const char *value = std::getenv("SIMAI_FIG2_QPS_PER_CHANNEL");
+    if (value == nullptr) return 0;
+    char *end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (*value == '\0' || *end != '\0' ||
+        (parsed != 1 && parsed != 2 && parsed != 4 && parsed != 8 && parsed != 16 && parsed != 32)) {
+      throw std::invalid_argument(
+          "SIMAI_FIG2_QPS_PER_CHANNEL must be 1, 2, 4, 8, 16, or 32");
+    }
+    return static_cast<int>(parsed);
+  }();
+  return qps;
+}
+
+void Figure2Post(Ptr<RdmaHw> hw, Ptr<RdmaQueuePair> qp,
+                 uint64_t expectedStart, uint64_t bytes) {
+  NS_ABORT_MSG_IF(qp->GetPostedLimit() != expectedStart,
+                  "Figure 2 QP posts were reordered");
+  hw->AppendDefaultQpBytes(qp, bytes);
+}
+
+void SendPersistentFlow(int src, int dst, uint64_t bytes,
+                        AstraSim::sim_request *request) {
+  const int qps = GetFigure2QpsPerChannel();
+  const int channel = request->flowTag.channel_id;
+  NS_ABORT_MSG_IF(channel < 0, "Figure 2 requires a valid channel ID");
+  NS_ABORT_MSG_IF(bytes == 0, "Figure 2 requires a nonempty fragment");
+  NS_ABORT_MSG_IF(rdma_transport_mode != 0 || cc_mode != 1 ||
+                      rc_ack_retry_enable != 0,
+                  "Figure 2 baseline requires RDMA_TRANSPORT_MODE=0, "
+                  "CC_MODE=1 (DCQCN), RC_ACK_RETRY_ENABLE=0");
+  Ptr<RdmaDriver> driver = n.Get(src)->GetObject<RdmaDriver>();
+  NS_ABORT_MSG_IF(driver == nullptr || driver->m_injectionMode != 0,
+                  "Figure 2 persistent QPs require RDMA_TRANSPORT_MODE=0");
+  Ptr<RdmaHw> hw = driver->m_rdma;
+  const bool nvls = request->flowTag.nvls_on;
+  if (nvls) driver->EnbaleNVLS();
+  else driver->DisableNVLS();
+
+  const uint64_t chunk = (bytes + qps - 1) / qps;
+  uint64_t remaining = bytes;
+  for (int index = 0; index < qps && remaining != 0; ++index) {
+    const uint64_t part = std::min(chunk, remaining);
+    remaining -= part;
+    Figure2Key key(src, dst, channel, index);
+    Figure2Qp &state = figure2Qps[key];
+    if (state.qp == nullptr) {
+      const uint32_t allocatedPort = portNumber[src][dst]++;
+      NS_ABORT_MSG_IF(allocatedPort == 0 || allocatedPort > 65535,
+                      "Figure 2 UDP source port exhausted");
+      const uint16_t sport = static_cast<uint16_t>(allocatedPort);
+      // Only the posted prefix is sent. m_size is a non-allocating lifetime
+      // upper bound so ACKs for one fragment cannot tear down this QP.
+      constexpr uint64_t capacity = 1ULL << 40;
+      state.qp = hw->CreateQueuePair(
+          src, dst, request->flowTag.current_flow_id, capacity, 3,
+          serverAddress[src], serverAddress[dst], sport, 100,
+          has_win ? (qp_win_bytes != 0 ? qp_win_bytes :
+                     (global_t == 1 ? maxBdp : pairBdp[n.Get(src)][n.Get(dst)])) : 0,
+          global_t == 1 ? maxRtt : pairRtt[src][dst],
+          Callback<void>(), Callback<void>(), 0);
+      const Figure2WireKey wire(serverAddress[src].Get(),
+                                serverAddress[dst].Get(), sport, 100, 3);
+      NS_ABORT_MSG_IF(figure2WireQps.count(wire) != 0,
+                      "Figure 2 QP five-tuple reused");
+      figure2WireQps.emplace(wire, key);
+      std::cout << "FIG2_QP_CREATE src=" << src << " dst=" << dst
+                << " channel=" << channel << " index=" << index
+                << " sport=" << sport << std::endl;
+    } else {
+      NS_ABORT_MSG_IF((state.qp->nvls_enable != 0) != nvls,
+                      "Figure 2 channel changed NVLS setting on a live QP");
+    }
+    const uint64_t start = state.reservedBytes;
+    // The legacy SeqTsHeader carries a 32-bit byte sequence number.
+    const uint64_t maxSeq = std::numeric_limits<uint32_t>::max() - packet_payload_size;
+    NS_ABORT_MSG_IF(start > maxSeq || part > maxSeq - start,
+                    "Figure 2 QP exceeded 32-bit byte sequence space");
+    state.reservedBytes += part;
+    const Figure2Fragment fragment{state.reservedBytes, part, request->flowTag};
+    state.txPending.push_back(fragment);
+    state.rxPending.push_back(fragment);
+    ++flow_input.idx;
+    const uint64_t now = Simulator::Now().GetNanoSeconds();
+    uint64_t startNs = 6000ULL * 1000;
+    if (const char *delay = std::getenv("AS_SEND_LAT")) {
+      startNs = static_cast<uint64_t>(std::stoull(delay)) * 1000;
+    }
+    Simulator::Schedule(NanoSeconds(startNs > now ? startNs - now : 0),
+                        &Figure2Post, hw, state.qp, start, part);
+    const auto flowKey = std::make_pair(request->flowTag.current_flow_id,
+                                        std::make_pair(src, dst));
+    ++waiting_to_sent_callback[flowKey];
+    ++waiting_to_notify_receiver[flowKey];
+  }
+}
+
 void SendFlow(int src, int dst, uint64_t maxPacketCount,
               void (*msg_handler)(void *fun_arg), void *fun_arg, int tag, AstraSim::sim_request *request) {
   MockNcclLog*NcclLog = MockNcclLog::getInstance();
+  if (std::getenv("SIMAI_FIG2_HASH_GROUPS_PER_CHANNEL") != nullptr) {
+    throw std::invalid_argument("Remove SIMAI_FIG2_HASH_GROUPS_PER_CHANNEL; "
+                                "use SIMAI_FIG2_QPS_PER_CHANNEL");
+  }
+  const int persistent = GetFigure2QpsPerChannel();
+  if (persistent != 0) {
+    static bool printed = false;
+    if (!printed) {
+      std::cout << "FIG2_QP_CONFIG qps_per_channel=" << persistent
+                << " lifetime=whole_run split_each_fragment=1"
+                << " rdma_mode=" << rdma_transport_mode
+                << " cc_mode=" << cc_mode
+                << " rc_ack_retry=" << rc_ack_retry_enable
+                << std::endl;
+      printed = true;
+    }
+    SendPersistentFlow(src, dst, maxPacketCount, request);
+    return;
+  }
   uint64_t PacketCount=((maxPacketCount+_QPS_PER_CONNECTION_-1)/_QPS_PER_CONNECTION_);
   uint64_t leftPacketCount = maxPacketCount;
   for(int index = 0 ;index<_QPS_PER_CONNECTION_;index++){
@@ -143,7 +285,8 @@ void SendFlow(int src, int dst, uint64_t maxPacketCount,
     NcclLog->writeLog(NcclLogLevel::DEBUG," request->flowTag [Packet sending event]  %dSendFlow to  %d tag_id:  %d flow_id  %d srcip  %d dstip  %d size:  %llu at the tick:  %d",request->flowTag.sender_node,request->flowTag.receiver_node,request->flowTag.tag_id,request->flowTag.current_flow_id,serverAddress[src],serverAddress[dst],maxPacketCount,AstraSim::Sys::boostedTick());
   RdmaClientHelper clientHelper(
       pg, serverAddress[src], serverAddress[dst], port, dport, real_PacketCount,
-      has_win ? (global_t == 1 ? maxBdp : pairBdp[n.Get(src)][n.Get(dst)]) : 0,
+      has_win ? (qp_win_bytes != 0 ? qp_win_bytes :
+                 (global_t == 1 ? maxBdp : pairBdp[n.Get(src)][n.Get(dst)])) : 0,
       global_t == 1 ? maxRtt : pairRtt[src][dst], msg_handler, fun_arg, tag,
       src, dst);
   if(nvls_on) clientHelper.SetAttribute("NVLS_enable", UintegerValue (1));
@@ -296,7 +439,56 @@ void notify_sender_packet_arrivered_receiver(int sender_node, int receiver_node,
   }
 }
 
+void Figure2TxProgress(Ptr<RdmaQueuePair> qp, uint64_t sent) {
+  Figure2WireKey wire(qp->sip.Get(), qp->dip.Get(), qp->sport,
+                       qp->dport, qp->m_pg);
+  const auto found = figure2WireQps.find(wire);
+  if (found == figure2WireQps.end()) return;
+  Figure2Qp &state = figure2Qps.at(found->second);
+  // Pop before calling the application; its callback can post more work.
+  while (!state.txPending.empty() && state.txPending.front().endSeq <= sent) {
+    const Figure2Fragment fragment = state.txPending.front();
+    state.txPending.pop_front();
+    const int src = qp->m_src, dst = qp->m_dest;
+    const auto key = std::make_pair(fragment.flowTag.current_flow_id,
+                                    std::make_pair(src, dst));
+    sent_chunksize[key] += fragment.bytes;
+    if (is_sending_finished(src, dst, fragment.flowTag)) {
+      const uint64_t total = sent_chunksize[key];
+      sent_chunksize.erase(key);
+      notify_sender_sending_finished(src, dst, total, fragment.flowTag);
+    }
+  }
+}
+
+void Figure2AckProgress(Ptr<RdmaQueuePair> qp, uint64_t received) {
+  const auto found = figure2WireQps.find(
+      Figure2WireKey(qp->sip.Get(), qp->dip.Get(), qp->sport,
+                     qp->dport, qp->m_pg));
+  if (found == figure2WireQps.end()) return;
+  Figure2Qp &state = figure2Qps.at(found->second);
+  const int src = std::get<0>(found->second);
+  const int dst = std::get<1>(found->second);
+  while (!state.rxPending.empty() && state.rxPending.front().endSeq <= received) {
+    const Figure2Fragment fragment = state.rxPending.front();
+    state.rxPending.pop_front();
+    const auto key = std::make_pair(fragment.flowTag.current_flow_id,
+                                    std::make_pair(src, dst));
+    received_chunksize[key] += fragment.bytes;
+    if (is_receive_finished(src, dst, fragment.flowTag)) {
+      const uint64_t total = received_chunksize[key];
+      received_chunksize.erase(key);
+      notify_receiver_receive_data(src, dst, total, fragment.flowTag);
+    }
+  }
+}
+
 void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
+  if (figure2WireQps.count(Figure2WireKey(q->sip.Get(), q->dip.Get(),
+                                         q->sport, q->dport, q->m_pg)) != 0) {
+    NS_ABORT_MSG("Figure 2 persistent QP unexpectedly terminated: sport="
+                 << q->sport << " qp_error=" << q->m_qpError);
+  }
   uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
   uint64_t base_rtt = pairRtt[sid][did], b = pairBw[sid][did];
   uint32_t total_bytes =
@@ -345,6 +537,10 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
 }
 
 void send_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
+  if (figure2WireQps.count(Figure2WireKey(q->sip.Get(), q->dip.Get(),
+                                         q->sport, q->dport, q->m_pg)) != 0) {
+    return; // per-fragment TX progress handles Figure 2 completion
+  }
   uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
   AstraSim::ncclFlowTag flowTag;
   MockNcclLog* NcclLog = MockNcclLog::getInstance();
@@ -379,6 +575,51 @@ int main1(string network_topo,string network_conf) {
     return -1;
   SetConfig();
   SetupNetwork(qp_finish,send_finish);
+
+  // IRN_PORT_V1: model-0 extension; legacy defaults when unset or zero.
+  if (const char *irn = std::getenv("SIMAI_IRN_ENABLE")) {
+    NS_ABORT_MSG_IF(std::string(irn) != "0" && std::string(irn) != "1",
+                    "SIMAI_IRN_ENABLE must be 0 or 1");
+    if (std::string(irn) == "1") {
+      NS_ABORT_MSG_IF(rdma_transport_mode != 0 || cc_mode != 1 || rc_ack_retry_enable != 0,
+                      "IRN v1 requires mode=0, DCQCN=1 and legacy RC retry disabled");
+      auto number = [](const char *key, uint64_t fallback) -> uint64_t {
+        const char *v = std::getenv(key);
+        if (v == nullptr) return fallback;
+        const std::string value(v);
+        NS_ABORT_MSG_IF(value.empty() || value.find_first_not_of("0123456789") != std::string::npos,
+                        "Invalid IRN integer: " << key);
+        return std::stoull(value);
+      };
+      const uint64_t bdp = number("SIMAI_IRN_BDP_BYTES", maxBdp);
+      // Derive timeouts from this topology, not 454/1350 us from the source
+      // simulator's short-distance fabric. These are explicit v1 choices.
+      const uint64_t low = number("SIMAI_IRN_RTO_LOW_NS", 2ULL * maxRtt);
+      const uint64_t high = number("SIMAI_IRN_RTO_HIGH_NS", 4ULL * maxRtt);
+      for (uint32_t i = 0; i < n.GetN(); ++i) {
+        Ptr<RdmaDriver> driver = n.Get(i)->GetObject<RdmaDriver>();
+        if (driver != nullptr) {
+          driver->m_rdma->ConfigureIrn(bdp, low, high);
+        }
+      }
+      std::cout << "IRN_CONFIG enabled=1 source=conweave_236a801"
+                << " state=byte_sack_ranges bdp_bytes=" << bdp
+                << " rto_low_ns=" << low << " rto_high_ns=" << high
+                << " cc=dcqcn legacy_rc_retry=0" << std::endl;
+    }
+  }
+
+
+  if (GetFigure2QpsPerChannel() != 0) {
+    for (uint32_t i = 0; i < n.GetN(); ++i) {
+      Ptr<RdmaDriver> driver = n.Get(i)->GetObject<RdmaDriver>();
+      if (driver != nullptr) {
+        driver->m_rdma->SetFlowProgressCallbacks(
+            MakeCallback(&Figure2TxProgress),
+            MakeCallback(&Figure2AckProgress));
+      }
+    }
+  }
 
 std::cout << "Running Simulation.\n";
   fflush(stdout);

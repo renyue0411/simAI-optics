@@ -26,6 +26,7 @@
 #include "ns3/network-module.h"
 #include "ns3/rdma-hw.h"
 #include "entry.h"
+#include "dci-spray-experiment.h" // DCI_SPRAY_V1
 #include <execinfo.h>
 #include <fstream>
 #include <iostream>
@@ -89,6 +90,12 @@ public:
              << "\n";
       }
     }
+    // IRN_PORT_V1: sim_finish exits directly, before Simulator::Destroy().
+    for (uint32_t i = 0; i < n.GetN(); ++i) {
+      Ptr<RdmaDriver> driver = n.Get(i)->GetObject<RdmaDriver>();
+      if (driver != nullptr) driver->m_rdma->PrintIrnStats();
+    }
+    DciSprayExperiment::Dump(n, true);
     exit(0);
     return 0;
   }
@@ -481,7 +488,8 @@ bool InstallStaticFlows(const std::vector<StaticFlowInput> &flows) {
     const uint32_t window =
         has_win
             ? static_cast<uint32_t>(
-                  global_t == 1 ? maxBdp : pairBdp[n.Get(flow.src)][n.Get(flow.dst)])
+                  qp_win_bytes != 0 ? qp_win_bytes :
+                  (global_t == 1 ? maxBdp : pairBdp[n.Get(flow.src)][n.Get(flow.dst)]))
             : 0;
     const uint64_t base_rtt =
         global_t == 1 ? maxRtt : pairRtt[flow.src][flow.dst];
@@ -647,6 +655,10 @@ int main(int argc, char *argv[]) {
   }
 
   main1(user_param.network_topo,user_param.network_conf);
+  const char* monitor_setting = std::getenv("SIMAI_NCCL_NET_MONITOR");
+  if (monitor_setting != nullptr && std::string(monitor_setting) == "1") {
+    schedule_monitor();
+  }
   int nodes_num = node_num - switch_num - ocs_num;
   int gpu_num = node_num - nvswitch_num - switch_num - ocs_num;
 
@@ -701,7 +713,12 @@ int main(int argc, char *argv[]) {
   }
   std::cout << "simulator run " << std::endl;
 
+  DciSprayExperiment::Schedule(n);
   Simulator::Run();
+  if (DciSprayExperiment::DeadlineHit()) {
+    Simulator::Destroy();
+    return 3;
+  }
   DumpOcsStatsFinal();
   Simulator::Stop(Seconds(2000000000));
   Simulator::Destroy();

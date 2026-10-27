@@ -21,6 +21,7 @@
 
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <time.h>
 #include <unordered_map>
@@ -71,6 +72,8 @@ std::string dctcp_rate_ai = "1000Mb/s";
 bool clamp_target_rate = false, l2_back_to_zero = false;
 double error_rate_per_link = 0.0;
 uint32_t has_win = 1;
+// Optional per-QP in-flight byte limit. Zero keeps the existing BDP policy.
+uint32_t qp_win_bytes = 0;
 uint32_t global_t = 1;
 uint32_t mi_thresh = 5;
 bool var_win = false, fast_react = true;
@@ -240,12 +243,16 @@ struct Interface {
   Interface() : idx(0), up(false) {}
 };
 map<Ptr<Node>, map<Ptr<Node>, Interface>> nbr2if;
+// Keep every physical interface between two switches. nbr2if retains the
+// first link for the existing node-level shortest-path calculation.
+map<Ptr<Node>, map<Ptr<Node>, vector<Interface>>> neighborLinks;
 map<Ptr<Node>, map<Ptr<Node>, vector<Ptr<Node>>>> nextHop;
 map<Ptr<Node>, map<Ptr<Node>, uint64_t>> pairDelay;
 map<Ptr<Node>, map<Ptr<Node>, uint64_t>> pairTxDelay;
 map<uint32_t, map<uint32_t, uint64_t>> pairBw;
 map<Ptr<Node>, map<Ptr<Node>, uint64_t>> pairBdp;
 map<uint32_t, map<uint32_t, uint64_t>> pairRtt;
+#include "dci-heterogeneous.h" // DCI_HETERO_V1
 
 struct FlowInput {
   uint32_t src, dst, pg, maxPacketCount, port, dport;
@@ -437,20 +444,28 @@ void SetRoutingEntries() {
       vector<Ptr<Node>> nexts = j->second;
       for (int k = 0; k < (int)nexts.size(); k++) {
         Ptr<Node> next = nexts[k];
-        uint32_t interface = nbr2if[node][next].idx;
-        if (node->GetNodeType() == 1) {
-          DynamicCast<SwitchNode>(node)->AddTableEntry(dstAddr, interface);
-        } else if(node->GetNodeType() == 2){
-					DynamicCast<NVSwitchNode>(node)->AddTableEntry(dstAddr, interface);
-          node->GetObject<RdmaDriver>()->m_rdma->AddTableEntry(dstAddr, interface, true);
-				} else {
-          bool is_nvswitch = false;
-					if(next->GetNodeType() == 2){ 
-						is_nvswitch = true;
-					}
-					node->GetObject<RdmaDriver>()->m_rdma->AddTableEntry(dstAddr, interface, is_nvswitch);
-          if(next->GetId() == dst->GetId())  {
-            node->GetObject<RdmaDriver>()->m_rdma->add_nvswitch(dst->GetId());
+        if (node->GetNodeType() == 1 && neighborLinks[node][next].size() > 1) {
+          NS_LOG_UNCOND("[TOPO ECMP] node=" << node->GetId()
+                        << " destination=" << dst->GetId()
+                        << " next=" << next->GetId()
+                        << " ports=" << neighborLinks[node][next].size());
+        }
+        for (const Interface &link : neighborLinks[node][next]) {
+          if (!link.up) {
+            continue;
+          }
+          uint32_t interface = link.idx;
+          if (node->GetNodeType() == 1) {
+            DynamicCast<SwitchNode>(node)->AddTableEntry(dstAddr, interface);
+          } else if (node->GetNodeType() == 2) {
+            DynamicCast<NVSwitchNode>(node)->AddTableEntry(dstAddr, interface);
+            node->GetObject<RdmaDriver>()->m_rdma->AddTableEntry(dstAddr, interface, true);
+          } else {
+            bool is_nvswitch = next->GetNodeType() == 2;
+            node->GetObject<RdmaDriver>()->m_rdma->AddTableEntry(dstAddr, interface, is_nvswitch);
+            if (next->GetId() == dst->GetId()) {
+              node->GetObject<RdmaDriver>()->m_rdma->add_nvswitch(dst->GetId());
+            }
           }
         }
       }
@@ -474,13 +489,18 @@ void printRoutingEntries() {
       vector<Ptr<Node>> nexts = j->second;
       for (int k = 0; k < (int)nexts.size(); k++) {
         Ptr<Node> firstHop = nexts[k];
-        uint32_t interface = nbr2if[src][firstHop].idx;
-        if(src->GetNodeType() == 0) {
-          Host[src][dst].push_back(pair<Ptr<Node>, uint32_t>(firstHop, interface));
-        } else if(src->GetNodeType() == 1) {
-          NetSwitch[src][dst].push_back(pair<Ptr<Node>, uint32_t>(firstHop, interface));
-        } else if(src->GetNodeType() == 2) {
-          NVSwitch[src][dst].push_back(pair<Ptr<Node>, uint32_t>(firstHop, interface));
+        for (const Interface &link : neighborLinks[src][firstHop]) {
+          if (!link.up) {
+            continue;
+          }
+          uint32_t interface = link.idx;
+          if (src->GetNodeType() == 0) {
+            Host[src][dst].push_back(pair<Ptr<Node>, uint32_t>(firstHop, interface));
+          } else if (src->GetNodeType() == 1) {
+            NetSwitch[src][dst].push_back(pair<Ptr<Node>, uint32_t>(firstHop, interface));
+          } else if (src->GetNodeType() == 2) {
+            NVSwitch[src][dst].push_back(pair<Ptr<Node>, uint32_t>(firstHop, interface));
+          }
         }
       }
     }
@@ -544,6 +564,14 @@ void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
   if (!nbr2if[a][b].up)
     return;
   nbr2if[a][b].up = nbr2if[b][a].up = false;
+  for (Interface &link : neighborLinks[a][b]) {
+    link.up = false;
+    DynamicCast<QbbNetDevice>(a->GetDevice(link.idx))->TakeDown();
+  }
+  for (Interface &link : neighborLinks[b][a]) {
+    link.up = false;
+    DynamicCast<QbbNetDevice>(b->GetDevice(link.idx))->TakeDown();
+  }
   nextHop.clear();
   CalculateRoutes(n);
 	for (uint32_t i = 0; i < n.GetN(); i++){
@@ -556,8 +584,6 @@ void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
 		else
 			n.Get(i)->GetObject<RdmaDriver>()->m_rdma->ClearTable();
 	}
-  DynamicCast<QbbNetDevice>(a->GetDevice(nbr2if[a][b].idx))->TakeDown();
-  DynamicCast<QbbNetDevice>(b->GetDevice(nbr2if[b][a].idx))->TakeDown();
   SetRoutingEntries();
 
   for (uint32_t i = 0; i < n.GetN(); i++) {
@@ -685,6 +711,12 @@ bool ReadConf(string network_topo,string network_conf) {
         conf >> fct_output_file;
       } else if (key.compare("HAS_WIN") == 0) {
         conf >> has_win;
+      } else if (key.compare("QP_WIN_BYTES") == 0) {
+        uint64_t value;
+        conf >> value;
+        NS_ABORT_MSG_IF(value > std::numeric_limits<uint32_t>::max(),
+                        "QP_WIN_BYTES exceeds the supported uint32_t window");
+        qp_win_bytes = static_cast<uint32_t>(value);
       } else if (key.compare("GLOBAL_T") == 0) {
         conf >> global_t;
         global_t = 1;
@@ -1296,6 +1328,11 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
                    "by the current nbr2if map. Use a distinct per-plane first-hop switch node: "
                    << src << " <-> " << dst);
     }
+    if (nbr2if[snode].count(dnode) != 0 &&
+        (snode->GetNodeType() != 1 || dnode->GetNodeType() != 1)) {
+      NS_ABORT_MSG("Parallel links are currently supported only between two EPS/router nodes: "
+                   << src << " <-> " << dst);
+    }
     
     qbb.SetDeviceAttribute("DataRate", StringValue(data_rate));
     qbb.SetChannelAttribute("Delay", StringValue(link_delay));
@@ -1328,26 +1365,35 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
           1, Ipv4InterfaceAddress(serverAddress[dst], Ipv4Mask(0xff000000)));
     }
 
-    nbr2if[snode][dnode].idx =
-        DynamicCast<QbbNetDevice>(d.Get(0))->GetIfIndex();
-    nbr2if[snode][dnode].up = true;
-    nbr2if[snode][dnode].delay =
-        DynamicCast<QbbChannel>(
-            DynamicCast<QbbNetDevice>(d.Get(0))->GetChannel())
-            ->GetDelay()
-            .GetTimeStep();
-    nbr2if[snode][dnode].bw =
-        DynamicCast<QbbNetDevice>(d.Get(0))->GetDataRate().GetBitRate();
-    nbr2if[dnode][snode].idx =
-        DynamicCast<QbbNetDevice>(d.Get(1))->GetIfIndex();
-    nbr2if[dnode][snode].up = true;
-    nbr2if[dnode][snode].delay =
-        DynamicCast<QbbChannel>(
-            DynamicCast<QbbNetDevice>(d.Get(1))->GetChannel())
-            ->GetDelay()
-            .GetTimeStep();
-    nbr2if[dnode][snode].bw =
-        DynamicCast<QbbNetDevice>(d.Get(1))->GetDataRate().GetBitRate();
+    Interface srcLink, dstLink;
+    srcLink.idx = DynamicCast<QbbNetDevice>(d.Get(0))->GetIfIndex();
+    srcLink.up = true;
+    srcLink.delay = DynamicCast<QbbChannel>(
+        DynamicCast<QbbNetDevice>(d.Get(0))->GetChannel())->GetDelay().GetTimeStep();
+    srcLink.bw = DynamicCast<QbbNetDevice>(d.Get(0))->GetDataRate().GetBitRate();
+    dstLink.idx = DynamicCast<QbbNetDevice>(d.Get(1))->GetIfIndex();
+    dstLink.up = true;
+    dstLink.delay = DynamicCast<QbbChannel>(
+        DynamicCast<QbbNetDevice>(d.Get(1))->GetChannel())->GetDelay().GetTimeStep();
+    dstLink.bw = DynamicCast<QbbNetDevice>(d.Get(1))->GetDataRate().GetBitRate();
+
+    if (nbr2if[snode].count(dnode) != 0) {
+      NS_ABORT_MSG_IF(!(DciHeterogeneous::Enabled() && DciHeterogeneous::WanPair(src, dst)) &&
+                      (nbr2if[snode][dnode].delay != srcLink.delay ||
+                       nbr2if[snode][dnode].bw != srcLink.bw),
+                      "Parallel paths must have equal rate and delay in the first ECMP experiment: "
+                      << src << " <-> " << dst);
+    } else {
+      nbr2if[snode][dnode] = srcLink;
+      nbr2if[dnode][snode] = dstLink;
+    }
+    neighborLinks[snode][dnode].push_back(srcLink);
+    neighborLinks[dnode][snode].push_back(dstLink);
+    if (neighborLinks[snode][dnode].size() > 1) {
+      NS_LOG_UNCOND("[TOPO PARALLEL LINK] src=" << src << " dst=" << dst
+                    << " total=" << neighborLinks[snode][dnode].size()
+                    << " src_if=" << srcLink.idx << " dst_if=" << dstLink.idx);
+    }
 
     // All explicit host ports use the same <nic>-<plane> identity namespace.
     // Scale-up identities are logged for topology correctness but remain on the
@@ -1359,18 +1405,18 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
                       << " nic=" << src_physical_nic
                       << " plane=" << src_plane
                       << " interface_id=" << src_logical_port
-                      << " ifindex=" << nbr2if[snode][dnode].idx);
+                      << " ifindex=" << srcLink.idx);
       }
       if (node_type[dst] == 0 && node_type[src] == 2 && dst_is_hierarchical_rnic) {
         NS_LOG_UNCOND("[TOPO SCALEUP] node=" << dst
                       << " nic=" << dst_physical_nic
                       << " plane=" << dst_plane
                       << " interface_id=" << dst_logical_port
-                      << " ifindex=" << nbr2if[dnode][snode].idx);
+                      << " ifindex=" << dstLink.idx);
       }
       if (node_type[src] == 0 && node_type[dst] != 2) {
         RnicPortBinding binding = {
-          src_logical_port, src_physical_nic, src_plane, nbr2if[snode][dnode].idx
+          src_logical_port, src_physical_nic, src_plane, srcLink.idx
         };
         pending_rnic_port_bindings[src].push_back(binding);
         if (src_is_hierarchical_rnic) {
@@ -1383,7 +1429,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
       }
       if (node_type[dst] == 0 && node_type[src] != 2) {
         RnicPortBinding binding = {
-          dst_logical_port, dst_physical_nic, dst_plane, nbr2if[dnode][snode].idx
+          dst_logical_port, dst_physical_nic, dst_plane, dstLink.idx
         };
         pending_rnic_port_bindings[dst].push_back(binding);
         if (dst_is_hierarchical_rnic) {
@@ -1406,8 +1452,8 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     bool rdmaControllerLink = (node_type[src] != 2 && node_type[dst] != 2);
     if (tdmController != 0 && rdmaControllerLink)
       {
-        uint32_t srcIfIndex = nbr2if[snode][dnode].idx;
-        uint32_t dstIfIndex = nbr2if[dnode][snode].idx;
+        uint32_t srcIfIndex = srcLink.idx;
+        uint32_t dstIfIndex = dstLink.idx;
 
         uint32_t rdmaSrcLogicalPort = has_explicit_ports
           ? src_logical_port
@@ -1421,15 +1467,15 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
                                           srcIfIndex,
                                           dst,
                                           rdmaDstLogicalPort,
-                                          nbr2if[snode][dnode].delay,
-                                          nbr2if[snode][dnode].bw);
+                                          srcLink.delay,
+                                          srcLink.bw);
         tdmController->AddPortBinding(dst,
                                           rdmaDstLogicalPort,
                                           dstIfIndex,
                                           src,
                                           rdmaSrcLogicalPort,
-                                          nbr2if[dnode][snode].delay,
-                                          nbr2if[dnode][snode].bw);
+                                          dstLink.delay,
+                                          dstLink.bw);
       }
 
     char ipstring[16];
@@ -1534,6 +1580,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
       }
       sw->m_mmu->ConfigNPort(sw->GetNDevices() - 1);
       sw->m_mmu->ConfigBufferSize(buffer_size * 1024 * 1024);
+      DciHeterogeneous::CheckMmu(sw->m_mmu, i);
       sw->m_mmu->node_id = sw->GetId();
     } else if(n.Get(i)->GetNodeType() == 2){ 
 			Ptr<NVSwitchNode> sw = DynamicCast<NVSwitchNode>(n.Get(i));
@@ -1554,6 +1601,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
       }
 			sw->m_mmu->ConfigNPort(sw->GetNDevices()-1);
 			sw->m_mmu->ConfigBufferSize(buffer_size* 1024 * 1024);
+      DciHeterogeneous::CheckMmu(sw->m_mmu, i);
 			sw->m_mmu->node_id = sw->GetId();
 		}
   }
@@ -1725,6 +1773,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
         maxRtt = rtt;
     }
   }
+  DciHeterogeneous::ApplyBounds(n);
   printf("maxRtt=%lu maxBdp=%lu\n", maxRtt, maxBdp);
 
   for (uint32_t i = 0; i < node_num; i++) {
@@ -1762,7 +1811,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
         sim_setting.port_speed[node][intf] = bps;
       }
     }
-    sim_setting.win = maxBdp;
+    sim_setting.win = qp_win_bytes != 0 ? qp_win_bytes : maxBdp;
     sim_setting.Serialize(trace_output);
   }
 
