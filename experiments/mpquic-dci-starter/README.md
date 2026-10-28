@@ -50,8 +50,8 @@ cmake -S . -B cmake-cache-mpquic -DNS3_MPQUIC=ON -DNS3_EXAMPLES=ON
 cmake --build cmake-cache-mpquic --target mpquic-dci -j1
 
 cd ~/myrdma/simAI-optics
-python3 experiments/scripts/run_mpquic.py minimal-dry --dry-run
-python3 experiments/scripts/run_mpquic.py minimal-001
+python3 experiments/scripts/run.py workflow mpquic minimal-dry --dry-run
+python3 experiments/scripts/run.py workflow mpquic minimal-001
 ```
 
 The generator and example have only been reviewed statically in this package.

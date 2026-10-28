@@ -31,7 +31,8 @@ CONFIG_LINE_RE = re.compile(r"^(?P<prefix>\s*)(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?P
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run one SimAI + NS-3 experiment."
+        description="Run one SimAI + NS-3 experiment. Use dci run/summary for reusable DCI batches.",
+        epilog="More commands: python3 experiments/scripts/run.py help"
     )
 
     parser.add_argument(
@@ -501,5 +502,57 @@ def main() -> int:
     return return_code
 
 
+def dispatch(argv):
+    """Keep the original single-run CLI and expose reusable workflow commands."""
+    import runpy
+    if argv == ["help"]:
+        print("Single experiment: run.py NAME --workload ... --topology ...")
+        print("DCI: run.py dci {run,summary,diagnose,ack-lag} ...")
+        print("Other workflows: run.py workflow {mpquic,tunnel,nccl-buffer,distance,longhaul,bandwidth,plot-bandwidth} ...")
+        print("Historical scripts: run.py legacy {baseline,irn-matrix,spray-v1,hetero-v1,diagnostics} ...")
+        return 0
+    if argv and argv[0] == "dci" and (len(argv) == 1 or argv[1] in
+            ("run", "summary", "diagnose", "ack-lag", "--help", "-h")):
+        sys.path.insert(0, str(EXPERIMENTS_DIR / "lib"))
+        from dci import main as dci_main
+        return dci_main(PROJECT_ROOT, argv[1:] or ["--help"])
+    routes = {
+        "workflow": {
+            "mpquic": "workflows/run_mpquic.py",
+            "tunnel": "workflows/run_dci_tunnel.py",
+            "nccl-buffer": "workflows/run_nccl_figure4.py",
+            "distance": "workflows/run_rdma_distance.py",
+            "longhaul": "workflows/run_rdma_longhaul.py",
+            "bandwidth": "workflows/analyze_nccl_figure2.py",
+            "plot-bandwidth": "workflows/plot_fig2_timeseries.py",
+        },
+        "legacy": {
+            "baseline": "legacy/dci/run_dci_v2_baseline.py",
+            "irn-matrix": "legacy/dci/complete_dci_irn_matrix.py",
+            "spray-v1": "legacy/dci/dci-spray-v1/run.py",
+            "hetero-v1": "legacy/dci/dci-hetero-v1/run.py",
+            "diagnostics": "legacy/dci/irn-diagnostics-v1/run.py",
+        },
+    }
+    if argv and argv[0] in routes and (len(argv) == 1 or argv[1] in routes[argv[0]] or argv[1] in ("-h", "--help")):
+        choices = routes[argv[0]]
+        if len(argv) < 2 or argv[1] in ("-h", "--help"):
+            print("Available " + argv[0] + " commands: " + ", ".join(choices))
+            return 0
+        if argv[0] == "workflow" and argv[1] == "plot-bandwidth" and any(a in ("-h", "--help") for a in argv[2:]):
+            print("Historical Figure 2 bandwidth plot; preserves the original fixed dataset and output paths.")
+            return 0
+        path = EXPERIMENTS_DIR / choices[argv[1]]
+        if not path.is_file():
+            print("Historical/optional script is not installed: " + str(path), file=sys.stderr)
+            return 2
+        sys.argv = [str(path), *argv[2:]]
+        sys.path.insert(0, str(path.parent))
+        runpy.run_path(str(path), run_name="__main__")
+        return 0
+    # Original argument parsing is unchanged, including --workload and --flow-file.
+    return main()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(dispatch(sys.argv[1:]))

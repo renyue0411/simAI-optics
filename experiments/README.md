@@ -1,3 +1,133 @@
+# 日常只使用一个入口
+
+```bash
+python3 experiments/scripts/run.py help
+```
+
+本次整理只改变 Python 工具组织，不修改 NS-3、IRN、负载、拓扑或现有实验结果。
+
+## 当前 DCI 实验
+
+```bash
+# 先看哪些结果会复用、哪些还缺；不启动仿真
+python3 experiments/scripts/run.py dci run --dry-run
+
+# 自动复用匹配的已有结果，只补缺少的 ECMP/轮询/随机 × IRN 开/关
+python3 experiments/scripts/run.py dci run
+
+# 重新汇总该组最近一次计划；不启动仿真
+python3 experiments/scripts/run.py dci summary
+```
+
+默认参数集中在 `experiments/configs/dci-routing/experiment.json`：4 GPU、
+256 MiB AllReduce、4 channels、4 QPs/channel、两条 400G/245us WAN、
+seed=1/run=1、1000ms 仿真预算、每组 600s 墙钟限制。
+配置或命令行参数只决定要跑的矩阵，不再生成新的运行脚本。
+
+```bash
+# 只考虑 IRN 关闭的三种方案
+python3 experiments/scripts/run.py dci run --irn 0
+
+# 随机模式扩展为 5 个 RngRun；ECMP/轮询只用列表第一个 run
+python3 experiments/scripts/run.py dci run --rng-runs 1,2,3,4,5
+
+# 改 QP 数，自动产生不同的实验身份和结果目录
+python3 experiments/scripts/run.py dci run --qps 8
+
+# 指定新的输入文件；是否支持异构延迟取决于现有 NS-3 后端，工具不偷偷改协议
+python3 experiments/scripts/run.py dci run --topology experiments/topologies/dci-routing/4gpu-2site-2x400g-50km.txt
+
+# 协议代码改变后重新运行所选矩阵；保留原结果
+python3 experiments/scripts/run.py dci run --fresh
+```
+
+不再手写 suffix。新结果自动命名；现有 `experiments/runs/` 中的文件不覆盖、不移动。
+有效的“仿真预算内未完成”结果也会复用；墙钟超时或损坏的结果不会当作有效结果。
+
+复用会核对 workload/topology 快照、规范化配置、QP/channel、IRN、seed/run、
+预算和日志完整性，不能只按文件名判断。较旧 manifest 未记录完整环境和二进制哈希，
+对此会明确标为 `historical`；代码更改后用 `--fresh`。
+`--strict-build` 只复用统一入口新记录且可执行文件 SHA256 相同的结果。
+
+结果索引及汇总位于：
+
+- `experiments/studies/dualpath/study.json`：最近一次矩阵计划和每组对应的原始结果目录。
+- `experiments/studies/dualpath/summary.csv`：该计划的汇总。
+- `experiments/runs/<自动名称>/`：原始输入快照、日志和输出。
+
+`--group NAME` 可维护另一份计划；同组新的运行选择会替换计划视图，但不会删除
+任何原始结果。`dci summary --group NAME` 汇总该组最后保存的计划。
+
+## IRN 诊断也复用同一入口
+
+分析你已有的日志，不需要重新跑：
+
+```bash
+python3 experiments/scripts/run.py dci diagnose irn-diag-v1-spray_rr-003 irn-diag-v1-spray_random-003
+python3 experiments/scripts/run.py dci ack-lag irn-diag-v1-spray_rr-003 irn-diag-v1-spray_random-003
+```
+
+需要采集新诊断时：
+
+```bash
+python3 experiments/scripts/run.py dci run --group diagnostic --irn 1 --routing spray_rr,spray_random --diagnostics
+```
+
+默认只跟踪 0->3 第一个 QP；可增加 `--diag-sport 10000`。
+诊断分析仍按单 QP 解释；不要把它直接当作整个作业的原因占比。
+
+## 其他既有实验
+
+以下保留原脚本参数，只改变调用入口。完整参数可在命令末尾加 `--help`。
+
+| 原脚本 | 固定调用方式 |
+|---|---|
+| `run_mpquic.py` | `python3 experiments/scripts/run.py workflow mpquic ...` |
+| `run_dci_tunnel.py` | `python3 experiments/scripts/run.py workflow tunnel ...` |
+| `run_rdma_distance.py` | `python3 experiments/scripts/run.py workflow distance ...` |
+| `run_rdma_longhaul.py` | `python3 experiments/scripts/run.py workflow longhaul ...` |
+| `run_nccl_figure4.py` | `python3 experiments/scripts/run.py workflow nccl-buffer ...` |
+| `analyze_nccl_figure2.py` | `python3 experiments/scripts/run.py workflow bandwidth RUN_DIR --ports 3,4` |
+| `plot_fig2_timeseries.py` | `python3 experiments/scripts/run.py workflow plot-bandwidth`，仍是原 Figure 2 固定数据集作图 |
+
+这些不同研究方向的实现保留在 `experiments/workflows/`，不是把它们强行改成同一个
+物理模型。日常通过 `run.py` 调用，无需记住底层文件名。
+
+## 历史脚本
+
+后加的 baseline/matrix 脚本及根目录的 DCI v1/v2 包会移入 `experiments/legacy/dci/`，
+保留 prepared、备份和其他原文件。没有安装过的包会跳过；整理不会删除旧结果。
+
+如果确实需要按原始命名读取某次旧汇总，可转发给归档版本：
+
+```bash
+python3 experiments/scripts/run.py legacy baseline --suffix 002 --summarize
+python3 experiments/scripts/run.py legacy irn-matrix --suffix 004 --random-runs 1 --summarize
+python3 experiments/scripts/run.py legacy diagnostics --suffix 003 --summarize
+```
+
+只有已经安装并被归档的旧工具才有对应入口；新实验使用 `dci run`。
+
+## 目录职责
+
+| 目录 | 内容 |
+|---|---|
+| `scripts/` | 唯一日常入口 `run.py` |
+| `lib/` | 共用的 DCI 运行、复用、结果校验和诊断实现 |
+| `workflows/` | MPQUIC、隧道、距离等独立工作流的既有实现 |
+| `configs/`、`topologies/`、`workloads/` | 可复用实验输入 |
+| `studies/` | 矩阵计划、结果索引和汇总 |
+| `runs/` | 每次运行的原始数据 |
+| `legacy/` | 历史工具和一次性整理的备份 |
+
+验证工具整理本身（使用合成日志和测试进程，不启动 NS-3）：
+
+```bash
+python3 -m unittest discover -s experiments/tests -p test_dci_tools.py
+```
+
+---
+
 # SimAI Experiment Framework
 
 本目录用于统一管理 SimAI + NS-3 仿真的输入文件、运行脚本和实验结果，避免 workload、topology、配置文件以及运行输出散落在项目根目录。
@@ -25,13 +155,9 @@ experiments/scripts/run.py
 * 保存运行命令、Git commit、环境变量和执行结果；
 * 将所有生成文件集中到对应的实验目录中。
 
-后续可在该目录中继续增加：
-
-```text
-sweep.py      # 批量参数实验
-analyze.py    # 实验结果整理与分析
-common.py     # 公共函数
-```
+批量运行、汇总和诊断统一使用 `run.py dci ...`。不要再为每轮实验新增一个
+`run_*.py`。公共实现位于 `lib/`，其他研究方向的既有工具位于 `workflows/`，
+由同一个入口转发调用。历史 DCI 脚本归档于 `legacy/dci/`。
 
 ### `configs/`
 

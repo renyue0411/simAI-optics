@@ -1,0 +1,16 @@
+{
+  "group": "dualpath",
+  "workload": "experiments/workloads/nccl-channel-buffer/micro-allreduce4-256mib.txt",
+  "topology": "experiments/topologies/dci-routing/4gpu-2site-2x400g-50km.txt",
+  "config_template": "experiments/configs/dci-routing/spray_rr.conf",
+  "routing": ["ecmp", "spray_rr", "spray_random"],
+  "irn": [0, 1],
+  "rng_runs": [1],
+  "seed": 1,
+  "channels": 4,
+  "qps": 4,
+  "budget_ms": 1000,
+  "wall_seconds": 600,
+  "gpu_nodes": [0, 1, 2, 3],
+  "dci_nodes": [6, 7]
+}

@@ -611,6 +611,8 @@ bool ReadConf(string network_topo,string network_conf) {
     std::ifstream conf;
     conf.open(network_conf);
     topology_file = network_topo;
+    std::string dciRoutingMode, dciRoutingNodes = "6,7";
+    bool dciRoutingConfigured = false;
     while (!conf.eof()) {
       std::string key;
       conf >> key;
@@ -699,6 +701,12 @@ bool ReadConf(string network_topo,string network_conf) {
         double v;
         conf >> v;
         error_rate_per_link = v;
+      } else if (key == "DCI_ROUTING_MODE" || key == "DCI_ROUTING_NODES") {
+        std::string value;
+        NS_ABORT_MSG_IF(!(conf >> value), "Missing value for " << key);
+        if (key == "DCI_ROUTING_MODE") dciRoutingMode = value;
+        else dciRoutingNodes = value;
+        dciRoutingConfigured = true;
       } else if (key.compare("CC_MODE") == 0) {
         conf >> cc_mode;
       } else if (key.compare("RATE_DECREASE_INTERVAL") == 0) {
@@ -911,6 +919,13 @@ bool ReadConf(string network_topo,string network_conf) {
       fflush(stdout);
     }
     conf.close();
+    if (dciRoutingConfigured) {
+      if (dciRoutingMode.empty()) {
+        const char *legacyMode = std::getenv("SIMAI_DCI_ROUTING");
+        dciRoutingMode = legacyMode ? legacyMode : "ecmp";
+      }
+      SwitchNode::ConfigureDciRouting(dciRoutingMode, dciRoutingNodes);
+    }
     return true;
 }
 

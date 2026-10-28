@@ -51,13 +51,13 @@ Prepare the sweep without starting ns-3:
 
 ```bash
 cd ~/myrdma/simAI-optics
-python3 experiments/scripts/run_rdma_longhaul.py article-50km-dry --dry-run
+python3 experiments/scripts/run.py workflow longhaul article-50km-dry --dry-run
 ```
 
 Run the QP sweep:
 
 ```bash
-python3 experiments/scripts/run_rdma_longhaul.py article-50km-001
+python3 experiments/scripts/run.py workflow longhaul article-50km-001
 ```
 
 Inspect only the compact summaries:

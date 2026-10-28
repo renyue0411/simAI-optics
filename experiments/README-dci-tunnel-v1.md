@@ -145,11 +145,11 @@ grep -n -B 3 -A 8 -m 3 -E 'error:|fatal error:|CMake Error' dci-tunnel-build.log
 
 ```bash
 cd ~/myrdma/simAI-optics
-python3 experiments/scripts/run_dci_tunnel.py path-dry-001 --dry-run
-python3 experiments/scripts/run_dci_tunnel.py path-single-001
-python3 experiments/scripts/run_dci_tunnel.py path-two-001 \
+python3 experiments/scripts/run.py workflow tunnel path-dry-001 --dry-run
+python3 experiments/scripts/run.py workflow tunnel path-single-001
+python3 experiments/scripts/run.py workflow tunnel path-two-001 \
   --flow-file experiments/workloads/dci-tunnel/two-flows.txt
-python3 experiments/scripts/run_dci_tunnel.py path-probe-outage-001 \
+python3 experiments/scripts/run.py workflow tunnel path-probe-outage-001 \
   --config-template experiments/configs/dci-tunnel/probe-outage.conf
 ```
 
