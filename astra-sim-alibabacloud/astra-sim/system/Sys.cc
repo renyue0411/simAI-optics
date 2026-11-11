@@ -424,6 +424,19 @@ int Sys::get_layer_numbers(std::string workload_input) {
   return Workload::get_layer_numbers(workload_input);
 }
 int Sys::get_priority(SchedulingPolicy pref_scheduling) {
+  // COLLECTIVE_FIFO_PREFERENCE_V1: the old implementation ignored explicit FIFO.
+  static const bool honorFifo = []() {
+    const char* raw = std::getenv("SIMAI_COLLECTIVE_FIFO");
+    const std::string value = raw ? raw : "0";
+    if (value != "0" && value != "1")
+      throw std::invalid_argument("SIMAI_COLLECTIVE_FIFO must be 0 or 1");
+    std::cout << "COLLECTIVE_FIFO_CONFIG enabled=" << (value == "1")
+              << " scope=explicit_fifo_preference default_policy=unchanged" << std::endl;
+    return value == "1";
+  }();
+  if (honorFifo && pref_scheduling == SchedulingPolicy::FIFO)
+    return priority_counter--;
+
   if (pref_scheduling == SchedulingPolicy::None) {
     if (scheduling_policy == SchedulingPolicy::LIFO) {
       return priority_counter++;

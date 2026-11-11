@@ -659,6 +659,7 @@ int main(int argc, char *argv[]) {
   if (monitor_setting != nullptr && std::string(monitor_setting) == "1") {
     schedule_monitor();
   }
+  DciPmCollective::Install(n, neighborLinks); // DCI_PM_COEXIST_V1
   int nodes_num = node_num - switch_num - ocs_num;
   int gpu_num = node_num - nvswitch_num - switch_num - ocs_num;
 

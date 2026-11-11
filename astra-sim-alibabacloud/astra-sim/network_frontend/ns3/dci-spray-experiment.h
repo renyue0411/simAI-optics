@@ -2,6 +2,8 @@
 #ifndef SIMAI_DCI_SPRAY_EXPERIMENT_H
 #define SIMAI_DCI_SPRAY_EXPERIMENT_H
 #include "ns3/abort.h"
+#include "dci-wan-profile.h"
+#include "dci-pm-collective.h" // DCI_PM_COEXIST_V1
 #include "ns3/node-container.h"
 #include "ns3/rdma-driver.h"
 #include "ns3/rdma-hw.h"
@@ -18,11 +20,14 @@ inline bool Enabled() { return std::getenv("SIMAI_DCI_EXPERIMENT_MS") != nullptr
 
 inline void Dump(const ns3::NodeContainer &nodes, bool completed) {
   if (!Enabled()) return;
+  DciPmCollective::Dump(); // DCI_PM_COEXIST_V1
+  DciWanProfile::Dump(); // DCI_WAN_PROFILE_V1
   ns3::SwitchNode::PrintDciRoutingStats();
   for (uint32_t i = 0; i < nodes.GetN(); ++i) {
     auto driver = nodes.Get(i)->GetObject<ns3::RdmaDriver>();
     if (driver == nullptr) continue;
     auto hw = driver->m_rdma;
+    hw->PrintCnpFeedbackStats(); // DCQCN_CNP_V1
     uint64_t retransBytes = 0, retransPackets = 0, timeouts = 0, nacks = 0;
     uint64_t outstanding = 0, acked = 0, posted = 0, received = 0, errors = 0;
     for (const auto &entry : hw->m_qpMap) {

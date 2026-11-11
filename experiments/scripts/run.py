@@ -503,54 +503,39 @@ def main() -> int:
 
 
 def dispatch(argv):
-    """Keep the original single-run CLI and expose reusable workflow commands."""
+    """Single entry for the current DCI experiments and existing single runs."""
     import runpy
-    if argv == ["help"]:
-        print("Single experiment: run.py NAME --workload ... --topology ...")
-        print("DCI: run.py dci {run,summary,diagnose,ack-lag} ...")
-        print("Other workflows: run.py workflow {mpquic,tunnel,nccl-buffer,distance,longhaul,bandwidth,plot-bandwidth} ...")
-        print("Historical scripts: run.py legacy {baseline,irn-matrix,spray-v1,hetero-v1,diagnostics} ...")
+    for part in ('runners', 'tools'):
+        sys.path.insert(0, str(EXPERIMENTS_DIR / 'scripts' / part))
+    if argv == ['help']:
+        print('Usage: python3 experiments/scripts/run.py COMMAND [options]')
+        print('  routing     C4Q4 ECMP / packet spraying comparison')
+        print('  collective  Collective and path-maintenance experiments')
+        print('  replay      Replay a recorded run with one-QP diagnostics')
+        print('  wan         Analyze WAN bandwidth and QP placement')
+        print('  check       Run Python tool checks (no ns-3 simulation)')
+        print('  check cnp   Run CNP acceptance with --checker BINARY')
+        print('  dci         General run / summary / diagnose / ack-lag commands')
+        print('Single run: run.py NAME --workload ... --topology ...')
         return 0
-    if argv and argv[0] == "dci" and (len(argv) == 1 or argv[1] in
-            ("run", "summary", "diagnose", "ack-lag", "--help", "-h")):
-        sys.path.insert(0, str(EXPERIMENTS_DIR / "lib"))
+    if argv and argv[0] == 'dci' and (len(argv) == 1 or argv[1] in
+            ('run', 'summary', 'diagnose', 'ack-lag', '--help', '-h')):
+        sys.path.insert(0, str(EXPERIMENTS_DIR / 'scripts'))
         from dci import main as dci_main
-        return dci_main(PROJECT_ROOT, argv[1:] or ["--help"])
-    routes = {
-        "workflow": {
-            "mpquic": "workflows/run_mpquic.py",
-            "tunnel": "workflows/run_dci_tunnel.py",
-            "nccl-buffer": "workflows/run_nccl_figure4.py",
-            "distance": "workflows/run_rdma_distance.py",
-            "longhaul": "workflows/run_rdma_longhaul.py",
-            "bandwidth": "workflows/analyze_nccl_figure2.py",
-            "plot-bandwidth": "workflows/plot_fig2_timeseries.py",
-        },
-        "legacy": {
-            "baseline": "legacy/dci/run_dci_v2_baseline.py",
-            "irn-matrix": "legacy/dci/complete_dci_irn_matrix.py",
-            "spray-v1": "legacy/dci/dci-spray-v1/run.py",
-            "hetero-v1": "legacy/dci/dci-hetero-v1/run.py",
-            "diagnostics": "legacy/dci/irn-diagnostics-v1/run.py",
-        },
-    }
-    if argv and argv[0] in routes and (len(argv) == 1 or argv[1] in routes[argv[0]] or argv[1] in ("-h", "--help")):
-        choices = routes[argv[0]]
-        if len(argv) < 2 or argv[1] in ("-h", "--help"):
-            print("Available " + argv[0] + " commands: " + ", ".join(choices))
-            return 0
-        if argv[0] == "workflow" and argv[1] == "plot-bandwidth" and any(a in ("-h", "--help") for a in argv[2:]):
-            print("Historical Figure 2 bandwidth plot; preserves the original fixed dataset and output paths.")
-            return 0
-        path = EXPERIMENTS_DIR / choices[argv[1]]
-        if not path.is_file():
-            print("Historical/optional script is not installed: " + str(path), file=sys.stderr)
-            return 2
-        sys.argv = [str(path), *argv[2:]]
-        sys.path.insert(0, str(path.parent))
-        runpy.run_path(str(path), run_name="__main__")
+        return dci_main(PROJECT_ROOT, argv[1:] or ['--help'])
+    if argv and argv[0] == 'wan':
+        sys.path.insert(0, str(EXPERIMENTS_DIR / 'scripts'))
+        from dci_common import wan_main
+        sys.argv = [sys.argv[0] + ' wan', *argv[1:]]
+        return wan_main()
+    direct = {'collective': 'runners/run_collective.py', 'routing': 'runners/run_routing.py',
+              'replay': 'tools/replay_irn_diag.py', 'check': 'tools/check_tools.py'}
+    if argv and argv[0] in direct:
+        script = EXPERIMENTS_DIR / 'scripts' / direct[argv[0]]
+        sys.argv = [str(script), *argv[1:]]
+        sys.path.insert(0, str(script.parent))
+        runpy.run_path(str(script), run_name='__main__')
         return 0
-    # Original argument parsing is unchanged, including --workload and --flow-file.
     return main()
 
 

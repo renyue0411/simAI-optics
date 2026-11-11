@@ -1,4 +1,11 @@
 """Reusable DCI experiment orchestration behind experiments/scripts/run.py."""
+
+import sys
+from pathlib import Path
+_scripts_dir = Path(__file__).resolve().parents[1]
+for _part in ('runners', 'tools'):
+    sys.path.insert(0, str(_scripts_dir / _part))
+
 import argparse
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -12,9 +19,10 @@ import statistics
 import subprocess
 import sys
 
-from dci_results import measure
+from dci_common import measure
+from dci_common import record_json, relocated_path
 
-MODES=('ecmp','spray_rr','spray_random')
+MODES=('ecmp','spray_rr','spray_random','qp_fixed')
 OUTPUT_KEYS={'FLOW_FILE','TRACE_FILE','TRACE_OUTPUT_FILE','FCT_OUTPUT_FILE','PFC_OUTPUT_FILE',
              'SEND_OUTPUT_FILE','QLEN_MON_FILE','BW_MON_FILE','RATE_MON_FILE','CNP_MON_FILE'}
 
@@ -67,11 +75,13 @@ def csv_values(raw,cast=int):
 
 def load_options(root,args):
     source=(root/args.spec).resolve() if not Path(args.spec).is_absolute() else Path(args.spec)
-    options=json.loads(source.read_text())
-    for key in ['group','workload','topology','config_template','seed','channels','qps','budget_ms','wall_seconds']:
+    options=record_json(source.read_text())
+    options.setdefault('ecmp_seed',0)
+    for key in ['group','workload','topology','config_template','seed','ecmp_seed','channels','qps','budget_ms','wall_seconds']:
         if getattr(args,key,None) is not None:options[key]=getattr(args,key)
     for key in ['routing','irn','rng_runs','gpu_nodes','dci_nodes']:
         if getattr(args,key,None) is not None:options[key]=getattr(args,key)
+    if not isinstance(options['ecmp_seed'],int) or not 0<=options['ecmp_seed']<=4294967295:raise ValueError('ecmp-seed must be a uint32')
     if not re.fullmatch('[A-Za-z0-9_-]+',options['group']):raise ValueError('invalid group name')
     if not options['routing'] or any(v not in MODES for v in options['routing']):raise ValueError('invalid routing mode')
     if not options['irn'] or any(v not in (0,1) for v in options['irn']):raise ValueError('IRN must be 0 and/or 1')
@@ -102,7 +112,7 @@ def case_specs(options):
                 config=configure(template,mode,options['dci_nodes'])
                 identity=dict(workload_sha256=digest(Path(options['workload']).read_bytes()),
                     topology_sha256=digest(Path(options['topology']).read_bytes()),configuration=normalized_config(config),
-                    routing=mode,irn=irn,rng_run=rng,seed=options['seed'],channels=options['channels'],qps=options['qps'],
+                    routing=mode,irn=irn,rng_run=rng,seed=options['seed'],ecmp_seed=options.get('ecmp_seed',0),channels=options['channels'],qps=options['qps'],
                     budget_ms=options['budget_ms'],gpu_nodes=options['gpu_nodes'],dci_nodes=options['dci_nodes'])
                 if options['diagnostics']:
                     identity['diagnostics']={k:options[k] for k in ('diag_src','diag_dst','diag_sport','max_events')}
@@ -120,8 +130,9 @@ def read_snapshot(run_dir,manifest,key):
 
 def probe_historical(folder,spec):
     expected=spec['identity']
+    if expected.get('ecmp_seed',0)!=0:return None
     try:
-        manifest=json.loads((folder/'outputs/manifest.json').read_text())
+        manifest=record_json((folder/'outputs/manifest.json').read_text())
         if manifest.get('threads')!=1 or manifest.get('environment',{}).get('AS_SEND_LAT')!='3' or manifest.get('environment',{}).get('AS_NVLS_ENABLE')!='0':return None
         workload=read_snapshot(folder,manifest,'workload');topology=read_snapshot(folder,manifest,'topology')
         config=read_snapshot(folder,manifest,'configuration')
@@ -150,7 +161,7 @@ def probe_historical(folder,spec):
             if int(diag[0]['max_events'])<d['max_events']:return None
         code=manifest.get('result',{}).get('return_code')
         row=measure(folder,spec['mode'],spec['irn'],spec['rng'],code,
-                    expected['budget_ms'],expected['seed'],tuple(expected['gpu_nodes']),tuple(expected['dci_nodes']))
+                    expected['budget_ms'],expected['seed'],tuple(expected['gpu_nodes']),tuple(expected['dci_nodes']),expected.get('ecmp_seed',0))
         if row['measurement']!='OK':return None
         row.update(source='historical',provenance='inputs_and_logged_settings; old binary/environment hashes unavailable')
         return row
@@ -165,11 +176,11 @@ def find_result(root,spec,strict_build=None):
         metadata=folder/'inputs/dci-case.json'
         if metadata.is_file():
             try:
-                record=json.loads(metadata.read_text())
+                record=record_json(metadata.read_text())
                 if record['identity']!=spec['identity']:continue
                 if strict_build and record.get('simulator_sha256')!=strict_build:continue
                 code=record.get('exit_code');e=spec['identity']
-                row=measure(folder,spec['mode'],spec['irn'],spec['rng'],code,e['budget_ms'],e['seed'],tuple(e['gpu_nodes']),tuple(e['dci_nodes']))
+                row=measure(folder,spec['mode'],spec['irn'],spec['rng'],code,e['budget_ms'],e['seed'],tuple(e['gpu_nodes']),tuple(e['dci_nodes']),e.get('ecmp_seed',0))
                 if row['measurement']=='OK':
                     row.update(source='cached',provenance='recorded_inputs_and_options');return row
             except (OSError,KeyError,ValueError,TypeError):continue
@@ -195,6 +206,7 @@ def execute(root,options,spec,sim,study):
         if key.startswith(('SIMAI_IRN_','SIMAI_NCCL_','SIMAI_FIG2_','SIMAI_DCI_')):env.pop(key)
     env.update(SIMAI_IRN_ENABLE=str(spec['irn']),SIMAI_NCCL_CHANNELS=str(options['channels']),
         SIMAI_FIG2_QPS_PER_CHANNEL=str(options['qps']),SIMAI_NCCL_NET_MONITOR='1',AS_PXN_ENABLE='0',AS_NVLS_ENABLE='0',
+        SIMAI_DCI_ECMP_SEED=str(spec['identity'].get('ecmp_seed',0)),
         SIMAI_DCI_EXPERIMENT_MS=str(options['budget_ms']),NS_GLOBAL_VALUE=f"RngSeed={options['seed']};RngRun={spec['rng']}")
     if options['diagnostics']:
         env.update(SIMAI_IRN_DIAG='1',SIMAI_IRN_DIAG_SRC=str(options['diag_src']),SIMAI_IRN_DIAG_DST=str(options['diag_dst']),
@@ -216,7 +228,7 @@ def execute(root,options,spec,sim,study):
     if (folder/'inputs').is_dir():
         record=dict(identity=spec['identity'],exit_code=code,simulator=str(sim),simulator_sha256=digest(sim.read_bytes()))
         (folder/'inputs/dci-case.json').write_text(json.dumps(record,indent=2)+'\n')
-    e=spec['identity'];row=measure(folder,spec['mode'],spec['irn'],spec['rng'],code,e['budget_ms'],e['seed'],tuple(e['gpu_nodes']),tuple(e['dci_nodes']))
+    e=spec['identity'];row=measure(folder,spec['mode'],spec['irn'],spec['rng'],code,e['budget_ms'],e['seed'],tuple(e['gpu_nodes']),tuple(e['dci_nodes']),e.get('ecmp_seed',0))
     row.update(source='new',provenance='recorded_inputs_and_options');return row
 
 
@@ -265,7 +277,7 @@ def main(root,argv):
         p.add_argument('--group');p.add_argument('--workload');p.add_argument('--topology');p.add_argument('--config-template')
         p.add_argument('--routing',type=lambda s:csv_values(s,str));p.add_argument('--irn',type=csv_values)
         p.add_argument('--rng-runs',type=csv_values);p.add_argument('--gpu-nodes',type=csv_values);p.add_argument('--dci-nodes',type=csv_values)
-        for key in ('seed','channels','qps','budget-ms','wall-seconds'):p.add_argument('--'+key,type=int)
+        for key in ('seed','ecmp-seed','channels','qps','budget-ms','wall-seconds'):p.add_argument('--'+key,type=int)
         p.add_argument('--simulator');p.add_argument('--fresh',action='store_true',help='rerun selected cases in new directories')
         p.add_argument('--strict-build',action='store_true',help='reuse only new records with the same executable SHA256')
         p.add_argument('--dry-run',action='store_true',help='print reuse/run plan without starting simulations')
@@ -277,28 +289,28 @@ def main(root,argv):
     args=parser.parse_args(argv)
     try:
         if args.action in ('diagnose','ack-lag'):
-            if args.action=='diagnose':from irn_diagnostics import analyze
-            else:from ack_lag import analyze
+            if args.action=='diagnose':from dci_common import analyze_irn as analyze
+            else:from dci_common import analyze_ack_lag as analyze
             for value in args.runs:analyze(resolve_log(root,value))
             return 0
         spec_path=Path(args.spec) if Path(args.spec).is_absolute() else root/args.spec
-        group=args.group or json.loads(spec_path.read_text())['group']
+        group=args.group or record_json(spec_path.read_text())['group']
         if not re.fullmatch('[A-Za-z0-9_-]+',group):raise ValueError('invalid group name')
-        study=root/'experiments/studies'/group
+        study=root/'experiments/runs/_batches'/group
         saved=study/'study.json'
-        overrides=('workload','topology','config_template','seed','channels','qps','budget_ms','wall_seconds','routing','irn','rng_runs','gpu_nodes','dci_nodes')
+        overrides=('workload','topology','config_template','seed','ecmp_seed','channels','qps','budget_ms','wall_seconds','routing','irn','rng_runs','gpu_nodes','dci_nodes')
         if args.action=='summary' and saved.is_file() and not args.diagnostics and not any(getattr(args,k,None) is not None for k in overrides):
-            state=json.loads(saved.read_text());rows=[]
+            state=record_json(saved.read_text());rows=[]
             for entry in state['cases']:
                 spec=entry['spec'];name=entry.get('run')
                 if not name:
                     rows.append(dict(run='',routing=spec['mode'],irn=spec['irn'],rng_run=spec['rng'],measurement='INVALID',outcome='MISSING',source='missing'));continue
                 e=spec['identity'];row=measure(root/'experiments/runs'/name,spec['mode'],spec['irn'],spec['rng'],entry.get('exit_code'),
-                    e['budget_ms'],e['seed'],tuple(e['gpu_nodes']),tuple(e['dci_nodes']))
+                    e['budget_ms'],e['seed'],tuple(e['gpu_nodes']),tuple(e['dci_nodes']),e.get('ecmp_seed',0))
                 row['source']=entry.get('source','cached');rows.append(row)
             report(rows,study);return int(any(r['measurement']!='OK' for r in rows))
         options=load_options(root,args)
-        study=root/'experiments/studies'/options['group']
+        study=root/'experiments/runs/_batches'/options['group']
         sim=simulator_path(root,args.simulator)
         strict=digest(sim.read_bytes()) if args.strict_build else None
         rows=[];entries=[]

@@ -253,6 +253,7 @@ map<uint32_t, map<uint32_t, uint64_t>> pairBw;
 map<Ptr<Node>, map<Ptr<Node>, uint64_t>> pairBdp;
 map<uint32_t, map<uint32_t, uint64_t>> pairRtt;
 #include "dci-heterogeneous.h" // DCI_HETERO_V1
+#include "dci-pm-delay-experiment.h" // DCI_PM_DELAY_V1
 
 struct FlowInput {
   uint32_t src, dst, pg, maxPacketCount, port, dport;
@@ -1393,7 +1394,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     dstLink.bw = DynamicCast<QbbNetDevice>(d.Get(1))->GetDataRate().GetBitRate();
 
     if (nbr2if[snode].count(dnode) != 0) {
-      NS_ABORT_MSG_IF(!(DciHeterogeneous::Enabled() && DciHeterogeneous::WanPair(src, dst)) &&
+      NS_ABORT_MSG_IF(!((DciHeterogeneous::Enabled() && DciHeterogeneous::WanPair(src, dst)) || DciPmDelayExperiment::AllowParallel(src, dst)) &&
                       (nbr2if[snode][dnode].delay != srcLink.delay ||
                        nbr2if[snode][dnode].bw != srcLink.bw),
                       "Parallel paths must have equal rate and delay in the first ECMP experiment: "
@@ -1789,6 +1790,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     }
   }
   DciHeterogeneous::ApplyBounds(n);
+  DciPmDelayExperiment::ApplyBounds(n); // DCI_PM_DELAY_V1
   printf("maxRtt=%lu maxBdp=%lu\n", maxRtt, maxBdp);
 
   for (uint32_t i = 0; i < node_num; i++) {
