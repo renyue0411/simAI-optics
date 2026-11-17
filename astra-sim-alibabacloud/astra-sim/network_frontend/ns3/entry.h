@@ -122,6 +122,7 @@ struct Figure2Fragment {
 struct Figure2Qp {
   Ptr<RdmaQueuePair> qp;
   uint64_t reservedBytes = 0;
+  uint64_t receiveTimingEndSeq = 0; // observation high-water mark only
   std::deque<Figure2Fragment> txPending;
   std::deque<Figure2Fragment> rxPending;
 };
@@ -144,10 +145,44 @@ int GetFigure2QpsPerChannel() {
   return qps;
 }
 
+// Optional application timing trace; does not schedule extra events.
+bool Figure2TimingEnabled() {
+  static const bool enabled = []() {
+    const char* value = std::getenv("SIMAI_DCI_FLOW_TIMING");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+  }();
+  return enabled;
+}
+
 void Figure2Post(Ptr<RdmaHw> hw, Ptr<RdmaQueuePair> qp,
                  uint64_t expectedStart, uint64_t bytes) {
   NS_ABORT_MSG_IF(qp->GetPostedLimit() != expectedStart,
                   "Figure 2 QP posts were reordered");
+  if (Figure2TimingEnabled()) {
+    const Figure2WireKey wire(qp->sip.Get(), qp->dip.Get(), qp->sport,
+                             qp->dport, qp->m_pg);
+    const auto found = figure2WireQps.find(wire);
+    if (found != figure2WireQps.end()) {
+      const auto& key = found->second;
+      const auto& pending = figure2Qps.at(key).rxPending;
+      for (const auto& fragment : pending) {
+        if (fragment.endSeq != expectedStart + bytes) continue;
+        std::cout << "DCI_FLOW_TIMING event=QP_POST"
+                  << " time_ns=" << Simulator::Now().GetNanoSeconds()
+                  << " src=" << std::get<0>(key)
+                  << " dst=" << std::get<1>(key)
+                  << " channel=" << std::get<2>(key)
+                  << " index=" << std::get<3>(key)
+                  << " flow_id=" << fragment.flowTag.current_flow_id
+                  << " chunk_id=" << fragment.flowTag.chunk_id
+                  << " sport=" << qp->sport
+                  << " bytes=" << bytes
+                  << " start_seq=" << expectedStart
+                  << " end_seq=" << fragment.endSeq << std::endl;
+        break;
+      }
+    }
+  }
   hw->AppendDefaultQpBytes(qp, bytes);
 }
 
@@ -439,6 +474,32 @@ void notify_sender_packet_arrivered_receiver(int sender_node, int receiver_node,
   }
 }
 
+// Observation only: leave rxPending and application completion driven by ACK.
+// Receiver byte-prefix arrival is not a WRITE-with-IMM CQE or GPU visibility.
+void Figure2RxProgress(Ptr<RdmaRxQueuePair> rx, uint64_t received) {
+  if (!Figure2TimingEnabled()) return;
+  // RX QP addresses/ports are local-to-remote, opposite to the DATA wire key.
+  const Figure2WireKey wire(rx->dip, rx->sip, rx->dport, rx->sport,
+                           rx->m_ecn_source.qIndex);
+  const auto found = figure2WireQps.find(wire);
+  if (found == figure2WireQps.end()) return;
+  const auto& key = found->second;
+  auto& state = figure2Qps.at(key);
+  for (const auto& fragment : state.rxPending) {
+    if (fragment.endSeq > received) break;
+    if (fragment.endSeq <= state.receiveTimingEndSeq) continue;
+    state.receiveTimingEndSeq = fragment.endSeq;
+    std::cout << "DCI_FLOW_TIMING event=QP_RX_CONTIGUOUS"
+              << " time_ns=" << Simulator::Now().GetNanoSeconds()
+              << " src=" << std::get<0>(key) << " dst=" << std::get<1>(key)
+              << " channel=" << std::get<2>(key) << " index=" << std::get<3>(key)
+              << " flow_id=" << fragment.flowTag.current_flow_id
+              << " chunk_id=" << fragment.flowTag.chunk_id
+              << " sport=" << rx->dport << " bytes=" << fragment.bytes
+              << " end_seq=" << fragment.endSeq << std::endl;
+  }
+}
+
 void Figure2TxProgress(Ptr<RdmaQueuePair> qp, uint64_t sent) {
   Figure2WireKey wire(qp->sip.Get(), qp->dip.Get(), qp->sport,
                        qp->dport, qp->m_pg);
@@ -478,6 +539,15 @@ void Figure2AckProgress(Ptr<RdmaQueuePair> qp, uint64_t received) {
     if (is_receive_finished(src, dst, fragment.flowTag)) {
       const uint64_t total = received_chunksize[key];
       received_chunksize.erase(key);
+      if (Figure2TimingEnabled()) {
+        std::cout << "DCI_FLOW_TIMING event=FLOW_ACKED"
+                  << " time_ns=" << Simulator::Now().GetNanoSeconds()
+                  << " src=" << src << " dst=" << dst
+                  << " channel=" << fragment.flowTag.channel_id
+                  << " flow_id=" << fragment.flowTag.current_flow_id
+                  << " chunk_id=" << fragment.flowTag.chunk_id
+                  << " bytes=" << total << std::endl;
+      }
       notify_receiver_receive_data(src, dst, total, fragment.flowTag);
     }
   }
@@ -617,6 +687,8 @@ int main1(string network_topo,string network_conf) {
         driver->m_rdma->SetFlowProgressCallbacks(
             MakeCallback(&Figure2TxProgress),
             MakeCallback(&Figure2AckProgress));
+        if (Figure2TimingEnabled())
+          driver->m_rdma->SetRxProgressCallback(MakeCallback(&Figure2RxProgress));
       }
     }
   }

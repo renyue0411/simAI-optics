@@ -62,7 +62,12 @@ inline void Observe(bool again) {
         << " state=" << ns3::DciPathManagerApp::StatusName(s.status)
         << " has_rtt=" << s.hasRtt << " samples=" << s.samples
         << " control_rtt_ns=" << s.latestRtt.GetNanoSeconds()
-        << " last_reply_ns=" << s.lastReply.GetNanoSeconds() << '\n';
+        << " last_reply_ns=" << s.lastReply.GetNanoSeconds()
+        << " local_stats_valid=" << s.hasLocalEgressStats
+        << " local_sample_time_ns=" << s.localSampleTimeNs
+        << " link_rate_bps=" << s.linkRateBps
+        << " egress_queue_bytes=" << s.egressQueueBytes
+        << " egress_tx_completed_bytes=" << s.egressTxCompletedBytes << '\n';
   if (again && state.observeUs)
     state.observer = ns3::Simulator::Schedule(ns3::MicroSeconds(state.observeUs), &Observe, true);
 }
